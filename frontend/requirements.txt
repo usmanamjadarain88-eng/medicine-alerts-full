@@ -1,0 +1,12 @@
+# Frontend: PyQt6 desktop app. Backend (API) is in ../backend.
+PyQt6>=6.4.0
+pyserial>=3.5
+Pillow>=9.0
+tkcalendar>=1.6
+schedule>=1.1
+requests>=2.28
+websockets>=12.0
+# Central DB client (frontend uses backend package or API)
+psycopg2-binary>=2.9
+# Build single .exe: pip install pyinstaller && pyinstaller Curax_PyQt.spec
+pyinstaller>=6.0

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Secrets / local-only config (DO NOT COMMIT)
+backend/.env
+backend/database_url.txt
+backend/backend_url.txt
+backend/api_base_url.txt
+backend/data_bus_url.txt
+

@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "Curax",
+    "slug": "curax-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "scheme": "curax",
+    "newArchEnabled": true,
+    "plugins": ["expo-router"]
+  }
+}
