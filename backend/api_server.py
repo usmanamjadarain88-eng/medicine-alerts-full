@@ -122,6 +122,20 @@ def get_db():
     return db
 
 
+# ---- Root / health (so URL in browser doesn't 404) ----
+@app.route("/")
+def root():
+    """So visiting the backend URL in a browser shows something instead of 404."""
+    return jsonify({"status": "ok", "message": "Medicine Alerts API", "docs": "Use POST/GET /save-credentials, /admin/data, /medicines, etc."})
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check for Railway/monitoring."""
+    db = get_db()
+    return jsonify({"status": "ok", "database": "connected" if (db and db.is_available()) else "disconnected"})
+
+
 # ---- Auth / credentials ----
 @app.route("/save-credentials", methods=["POST"])
 def save_credentials():
