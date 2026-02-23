@@ -1,0 +1,4 @@
+# Backend: REST API + Central DB (PostgreSQL). Replace with FastAPI later if desired.
+flask>=2.3
+psycopg2-binary>=2.9
+python-dotenv>=1.0

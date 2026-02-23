@@ -1,0 +1,18 @@
+[
+  {
+    "time": "",
+    "message": "{'15_min_before': True, 'exact_time': True, '5_min_after': True, 'missed_alert': True, 'snooze_duration': 5}"
+  },
+  {
+    "time": "17:25",
+    "message": ""
+  },
+  {
+    "time": "17:25",
+    "message": ""
+  },
+  {
+    "time": "08:00",
+    "message": "Birthday"
+  }
+]

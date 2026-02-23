@@ -1,0 +1,76 @@
+# Curax design system — one source for colors, spacing, type, radius
+
+# —— Primary (brand) ——
+PRIMARY = "#0D9488"
+PRIMARY_HOVER = "#0F766E"
+PRIMARY_LIGHT = "#CCFBF1"
+PRIMARY_DARK_BG = "#134E4A"
+
+# Legacy aliases (keep for compatibility)
+NEON_GREEN = "#06402B"
+NEON_GREEN_GLOW = "rgba(6, 64, 43, 0.25)"
+NEON_GREEN_DIM = "#0C6A49"
+
+# —— Neutrals (light) ——
+BG_LIGHT = "#F8FAFC"
+BG_CARD_LIGHT = "#FFFFFF"
+BG_INPUT_LIGHT = "#F1F5F9"
+BORDER_LIGHT = "#E2E8F0"
+TEXT_PRIMARY_LIGHT = "#0F172A"
+TEXT_SECONDARY_LIGHT = "#64748B"
+ACCENT_LIGHT = "#0D9488"
+SECONDARY_LIGHT_DARK = "#334155"
+
+# —— Neutrals (dark) ——
+BG_DARK = "#0F172A"
+BG_CARD = "#1E293B"
+BG_INPUT = "#334155"
+BORDER = "#475569"
+TEXT_PRIMARY = "#F8FAFC"
+TEXT_SECONDARY = "#94A3B8"
+ACCENT_DARK = "#2DD4BF"
+ACCENT_DARK_DIM = "#14B8A6"
+
+# —— Semantic ——
+LOW_STOCK_YELLOW = "#F59E0B"
+LOW_STOCK_RED = "#EF4444"
+SUCCESS = "#10B981"
+WARNING = "#F59E0B"
+ERROR = "#EF4444"
+INFO = "#3B82F6"
+
+# —— Spacing (px) ——
+SPACE_4 = "4px"
+SPACE_8 = "8px"
+SPACE_12 = "12px"
+SPACE_16 = "16px"
+SPACE_20 = "20px"
+SPACE_24 = "24px"
+SPACE_32 = "32px"
+SPACE_48 = "48px"
+
+# —— Radius ——
+RADIUS = "12px"
+RADIUS_SM = "8px"
+RADIUS_LG = "16px"
+RADIUS_FULL = "9999px"
+
+# —— Typography (font-size) ——
+FONT_XS = "10px"
+FONT_SM = "12px"
+FONT_BASE = "14px"
+FONT_MD = "16px"
+FONT_LG = "18px"
+FONT_XL = "24px"
+FONT_2XL = "32px"
+
+# —— Charts / analytics ——
+CHART_COLORS = ["#0D9488", "#3B82F6", "#8B5CF6", "#F59E0B", "#EC4899", "#14B8A6"]
+
+# —— Sidebar ——
+SIDEBAR_WIDTH = "260px"
+SIDEBAR_COLLAPSED = "72px"
+SIDEBAR_BG_LIGHT = "#FFFFFF"
+SIDEBAR_BG_DARK = "#1E293B"
+SIDEBAR_ACTIVE_LIGHT = "#CCFBF1"
+SIDEBAR_ACTIVE_DARK = "#134E4A"
