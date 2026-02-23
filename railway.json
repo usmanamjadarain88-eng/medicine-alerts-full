@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r backend/requirements.txt"
+  },
+  "deploy": {
+    "startCommand": "gunicorn --bind 0.0.0.0:$PORT backend.api_server:app"
+  }
+}
