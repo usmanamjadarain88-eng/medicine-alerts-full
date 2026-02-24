@@ -66,7 +66,14 @@ def get_data_bus_url():
                             return _line.rstrip("/")
             except Exception:
                 pass
-    return ""
+    # Default: deployed data bus on Railway (receives notify_admin from backend for real-time sync)
+    return "https://databus-production.up.railway.app"
+
+
+try:
+    from .central_db import EmailAlreadyUsedError
+except ImportError:
+    from central_db import EmailAlreadyUsedError
 
 
 def notify_databus(access_code):
@@ -86,10 +93,13 @@ def notify_databus(access_code):
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=5) as _:
-            pass
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if 200 <= getattr(resp, "status", 0) < 300:
+                pass  # success
+            else:
+                print(f"  [notify_databus] data bus returned {getattr(resp, 'status', 0)}")
+    except Exception as e:
+        print(f"  [notify_databus] failed: {e}")
 
 
 def get_db():
@@ -156,17 +166,20 @@ def save_credentials():
     if not bot_id or not api_key:
         return jsonify({"message": "bot_id and api_key required"}), 400
     if role == "admin":
-        if access_code:
-            admin_id, admin_access_code, connection_code = db.update_admin_bot_by_access_code(
-                access_code, bot_id, api_key, name=name, email=email
-            )
-            if admin_id:
-                notify_databus(admin_access_code or access_code)
-                return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
-        admin_id, admin_access_code, connection_code = db.upsert_admin_from_bot(bot_id, api_key, name=name, email=email)
-        if admin_access_code:
-            notify_databus(admin_access_code)
-        return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
+        try:
+            if access_code:
+                admin_id, admin_access_code, connection_code = db.update_admin_bot_by_access_code(
+                    access_code, bot_id, api_key, name=name, email=email
+                )
+                if admin_id:
+                    notify_databus(admin_access_code or access_code)
+                    return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
+            admin_id, admin_access_code, connection_code = db.upsert_admin_from_bot(bot_id, api_key, name=name, email=email)
+            if admin_access_code:
+                notify_databus(admin_access_code)
+            return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
+        except EmailAlreadyUsedError:
+            return jsonify({"message": "An admin with this email already exists. Delete the existing admin first."}), 409
     admin_id = data.get("admin_id")
     if not admin_id:
         return jsonify({"message": "admin_id required for role=user"}), 400
@@ -309,7 +322,9 @@ def admin_sync():
         return jsonify({"message": "access_code required"}), 400
     db = get_db()
     if not db:
-        return jsonify({"message": "Central DB not configured"}), 503
+        return jsonify({
+            "message": "Central DB not configured. Set DATABASE_URL (e.g. Neon connection string) in server environment (e.g. Railway project variables)."
+        }), 503
     result = db.get_role_by_access_code(access_code)
     if not result:
         return jsonify({"message": "Invalid access code"}), 404
@@ -319,7 +334,12 @@ def admin_sync():
     medicine_boxes = data.get("medicine_boxes") if isinstance(data.get("medicine_boxes"), dict) else {}
     dose_log = data.get("dose_log") if isinstance(data.get("dose_log"), list) else []
     try:
-        db.sync_admin_dashboard_data(admin_id, medicine_boxes, dose_log)
+        ok = db.sync_admin_dashboard_data(admin_id, medicine_boxes, dose_log)
+        if not ok:
+            print(f"  [admin/sync] sync_admin_dashboard_data returned False (dashboard user may be missing)")
+            return jsonify({"message": "Failed to write dashboard data (no dashboard user)"}), 500
+        n_boxes = sum(1 for b in (medicine_boxes or {}) if medicine_boxes.get(b))
+        print(f"  [admin/sync] saved {n_boxes} medicine box(es) for admin_id={admin_id}")
     except Exception as e:
         print(f"  [admin/sync] sync_admin_dashboard_data: {e}")
         return jsonify({"message": "Failed to write dashboard data"}), 500
@@ -573,11 +593,13 @@ if __name__ == "__main__":
     if url:
         print("DATABASE_URL: set (%s...)" % (url[:50] if len(url) > 50 else url))
     else:
-        print("DATABASE_URL: NOT SET (check backend/database_url.txt exists)")
+        print("DATABASE_URL: NOT SET - Central DB will not store data!")
+        print("  Local: put Neon URL in backend/database_url.txt (one line)")
+        print("  Railway/deploy: set DATABASE_URL in project environment variables")
     db = get_db()
     if db:
         print("Database connection: OK")
     else:
-        print("Database connection: FAILED (503 will be returned for API calls)")
+        print("Database connection: FAILED - /admin/sync and /admin/data will return 503")
     print("")
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
