@@ -1,8 +1,6 @@
 name: Medicine Alert
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'  # every 5 minutes
   workflow_dispatch:
 
 jobs:
@@ -17,12 +15,10 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install dependencies
-        run: pip install requests
-
       - name: Run alert script
         run: python .github/scripts/alerts.py
         env:
           MAILGUN_API_KEY: ${{ secrets.MAILGUN_API_KEY }}
           MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          ALERT_TZ: ${{ secrets.ALERT_TZ }}
