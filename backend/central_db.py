@@ -32,6 +32,10 @@ def _get_connection_string(url=None, **kwargs):
     return (os.environ.get("DATABASE_URL") or os.environ.get("CENTRAL_DB_URL") or "").strip() or None
 
 
+class EmailAlreadyUsedError(Exception):
+    """Raised when creating or updating an admin with an email that another admin already has."""
+
+
 class CentralDB:
     """PostgreSQL central DB: admins and users (one admin ↔ their users; multiple admins)."""
 
@@ -96,17 +100,52 @@ class CentralDB:
         return "C" + (secrets.token_hex(4).upper()[: _ADMIN_CODE_LENGTH - 1])  # fallback
 
     # ---- Admins (from Admin Panel: bot_id + api_key) ----
+    def _admin_id_by_email(self, email):
+        """Return admin id that has this email (normalized: strip + lower), or None. Used to enforce one admin per email."""
+        raw = (email or "").strip()
+        if not raw:
+            return None
+        norm = raw.lower()
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT id FROM admins WHERE LOWER(TRIM(email)) = %s LIMIT 1",
+                (norm,),
+            )
+            row = cur.fetchone()
+            if row:
+                return str(row["id"]) if hasattr(row, "keys") else str(row[0])
+            return None
+        finally:
+            cur.close()
+
     def upsert_admin_from_bot(self, bot_id, api_key, name=None, email=None):
         """Insert or update admin by (bot_id, api_key). Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         New admins get unique admin_access_code and connection_code; existing admins keep their codes.
+        Raises EmailAlreadyUsedError if a non-empty email is already used by another admin (one admin per email until that admin is deleted).
+        When an access code is allotted, the admin has full permissions (is_admin=true).
         """
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
         if not bot_id or not api_key:
             return None, None, None
+        email_val = (email or "").strip()
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
+            # If email is provided, ensure no other admin has it (same admin can keep their own email)
+            if email_val:
+                existing_id = self._admin_id_by_email(email_val)
+                if existing_id:
+                    cur.execute(
+                        "SELECT id FROM admins WHERE bot_id = %s AND api_key = %s LIMIT 1",
+                        (bot_id, api_key),
+                    )
+                    current = cur.fetchone()
+                    current_id = str(current["id"]) if current and hasattr(current, "keys") else (str(current[0]) if current else None)
+                    if current_id != existing_id:
+                        raise EmailAlreadyUsedError("An admin with this email already exists.")
             access_code = self._generate_admin_access_code()
             connection_code = self._generate_connection_code()
             cur.execute(
@@ -118,10 +157,11 @@ class CentralDB:
                               email = COALESCE(EXCLUDED.email, admins.email),
                               admin_access_code = COALESCE(admins.admin_access_code, EXCLUDED.admin_access_code),
                               connection_code = COALESCE(admins.connection_code, EXCLUDED.connection_code),
+                              is_admin = true,
                               updated_at = NOW()
                 RETURNING id, admin_access_code, connection_code
                 """,
-                (name or "", email or "", bot_id, api_key, access_code, connection_code),
+                (name or "", email_val or "", bot_id, api_key, access_code, connection_code),
             )
             row = cur.fetchone()
             conn.commit()
@@ -131,6 +171,9 @@ class CentralDB:
                 cc = (row["connection_code"] if hasattr(row, "keys") else row[2]) if row else None
                 return (str(aid) if isinstance(aid, uuid.UUID) else aid), (ac or access_code), (cc or connection_code)
             return None, None, None
+        except EmailAlreadyUsedError:
+            conn.rollback()
+            raise
         except Exception as e:
             conn.rollback()
             print(f"CentralDB upsert_admin_from_bot: {e}")
@@ -141,6 +184,8 @@ class CentralDB:
     def update_admin_bot_by_access_code(self, access_code, bot_id, api_key, name=None, email=None):
         """Find admin by access_code and set their bot_id, api_key, name, email (e.g. when app registers).
         If another admin row has this (bot_id, api_key), delete it first so we keep one admin per access_code.
+        Raises EmailAlreadyUsedError if the new email is already used by another admin.
+        Access-code admins have full permissions (is_admin=true).
         Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         """
         code = (access_code or "").strip().upper()
@@ -148,6 +193,7 @@ class CentralDB:
             return None, None, None
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
+        email_val = (email or "").strip()
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
@@ -156,6 +202,11 @@ class CentralDB:
             if not target:
                 return None, None, None
             target_id = target["id"] if hasattr(target, "keys") else target[0]
+            target_id_str = str(target_id)
+            if email_val:
+                existing_id = self._admin_id_by_email(email_val)
+                if existing_id and existing_id != target_id_str:
+                    raise EmailAlreadyUsedError("An admin with this email already exists.")
             cur.execute(
                 "DELETE FROM admins WHERE bot_id = %s AND api_key = %s AND id != %s::uuid",
                 (bot_id, api_key, target_id),
@@ -163,11 +214,11 @@ class CentralDB:
             cur.execute(
                 """
                 UPDATE admins SET bot_id = %s, api_key = %s, name = COALESCE(NULLIF(%s, ''), name),
-                email = COALESCE(NULLIF(%s, ''), email), updated_at = NOW()
+                email = COALESCE(NULLIF(%s, ''), email), is_admin = true, updated_at = NOW()
                 WHERE admin_access_code = %s
                 RETURNING id, admin_access_code, connection_code
                 """,
-                (bot_id, api_key, name or "", email or "", code),
+                (bot_id, api_key, name or "", email_val or "", code),
             )
             row = cur.fetchone()
             conn.commit()
@@ -177,6 +228,9 @@ class CentralDB:
                 cc = (row["connection_code"] if hasattr(row, "keys") else row[2]) if row else None
                 return (str(aid) if isinstance(aid, uuid.UUID) else aid), ac, cc
             return None, None, None
+        except EmailAlreadyUsedError:
+            conn.rollback()
+            raise
         except Exception as e:
             conn.rollback()
             print(f"CentralDB update_admin_bot_by_access_code: {e}")
@@ -492,6 +546,7 @@ class CentralDB:
         """
         duid = self.get_dashboard_user_id(admin_id)
         if not duid:
+            print(f"CentralDB sync_admin_dashboard_data: no dashboard user for admin_id={admin_id}")
             return False
         existing_medicines = self.list_medicines(duid)
         by_box = {m.get("box_id"): m for m in existing_medicines if m.get("box_id")}
@@ -542,8 +597,6 @@ class CentralDB:
         except Exception as e:
             conn.rollback()
             print(f"CentralDB sync_admin_dashboard_data delete dose_logs: {e}")
-            cur.close()
-            return True
         finally:
             cur.close()
 
