@@ -206,10 +206,28 @@ def connect_to_admin():
     if not admin:
         return jsonify({"message": "Invalid connection code"}), 404
     admin_id = admin.get("id")
+    admin_name = admin.get("name") or ""
     user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name)
     if not user_id:
         return jsonify({"message": "Failed to link user"}), 500
-    return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id})
+    return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id, "admin_name": admin_name})
+
+
+@app.route("/admin/linked-users", methods=["GET"])
+def get_linked_users():
+    """GET /admin/linked-users?access_code=... -> list of users linked to this admin (excluding dashboard user)."""
+    access_code = (request.args.get("access_code") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"users": []}), 503
+    if not access_code:
+        return jsonify({"users": []}), 400
+    admin = db.get_admin_by_access_code(access_code)
+    if not admin:
+        return jsonify({"users": []}), 404
+    admin_id = admin.get("id")
+    users = db.get_all_users_by_admin_id(admin_id) or []
+    return jsonify({"users": users})
 
 
 @app.route("/verify-credentials", methods=["POST"])
@@ -376,6 +394,10 @@ def admin_sync():
         # Also persist SMS / mobile notification config centrally, so Android can read it too.
         if isinstance(data.get("sms_config"), dict):
             settings["sms_config"] = data["sms_config"]
+        if isinstance(data.get("mobile_bot_config"), dict):
+            settings["mobile_bot_config"] = data["mobile_bot_config"]
+        if isinstance(data.get("admin_bot_config"), dict):
+            settings["admin_bot_config"] = data["admin_bot_config"]
 
         # Persist rich medicine metadata from desktop payload so Android and desktop stay field-aligned.
         incoming_meta = _extract_medicine_meta_from_boxes(medicine_boxes)
@@ -873,6 +895,32 @@ def sync_post():
     if out is None:
         return jsonify({"message": "user not found for bot_id+api_key"}), 404
     return jsonify(out)
+
+
+# ---- Backend alert scheduler (single instance per process) ----
+_alert_scheduler_instance = None
+
+
+def _start_alert_scheduler():
+    global _alert_scheduler_instance
+    if _alert_scheduler_instance is not None:
+        return
+    if os.environ.get("DISABLE_ALERT_SCHEDULER", "").strip().lower() in ("1", "true", "yes"):
+        print("[AlertScheduler] Disabled via DISABLE_ALERT_SCHEDULER env var")
+        return
+    try:
+        try:
+            from .alert_scheduler import BackendAlertScheduler
+        except ImportError:
+            from alert_scheduler import BackendAlertScheduler
+        _alert_scheduler_instance = BackendAlertScheduler(get_db)
+        _alert_scheduler_instance.start()
+    except Exception as e:
+        print(f"[AlertScheduler] Failed to start: {e}")
+
+
+# Start scheduler when imported by gunicorn (module-level, runs once per worker)
+_start_alert_scheduler()
 
 
 if __name__ == "__main__":
