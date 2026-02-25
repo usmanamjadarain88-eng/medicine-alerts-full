@@ -149,7 +149,7 @@ def health():
 # ---- Auth / credentials ----
 @app.route("/save-credentials", methods=["POST"])
 def save_credentials():
-    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } → admins or users.
+    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } â†’ admins or users.
     If role=admin and access_code is sent, update that admin's bot_id/api_key (so app links to desktop-created admin).
     """
     data = request.get_json() or {}
@@ -189,7 +189,7 @@ def save_credentials():
 
 @app.route("/connect-to-admin", methods=["POST"])
 def connect_to_admin():
-    """POST { connection_code, bot_id, api_key, name? } → link this app (user) to the admin with that connection_code.
+    """POST { connection_code, bot_id, api_key, name? } â†’ link this app (user) to the admin with that connection_code.
     Backend creates/updates user row with this admin_id and bot_id+api_key. Returns admin_id on success.
     """
     data = request.get_json() or {}
@@ -259,7 +259,7 @@ def get_role():
 
 @app.route("/admin/data", methods=["GET"])
 def admin_data():
-    """GET /admin/data?access_code=...&last_sync_time=... (optional) → dashboard data.
+    """GET /admin/data?access_code=...&last_sync_time=... (optional) â†’ dashboard data.
     If last_sync_time (ISO) is sent, only data updated after that time is returned (incremental). Always returns server_time.
     """
     access_code = (request.args.get("access_code") or "").strip()
@@ -313,7 +313,7 @@ def admin_data():
 
 @app.route("/admin/sync", methods=["POST"])
 def admin_sync():
-    """POST { "access_code", "medicine_boxes", "dose_log", "alert_settings", "gmail_config", "medical_reminders" }.
+    """POST { "access_code", "medicine_boxes", "dose_log", "alert_settings", "gmail_config", "medical_reminders", "sms_config" }.
     Write all admin data to Central DB (per admin). Then notify data bus so other clients get the update via WebSocket.
     """
     data = request.get_json(silent=True) or {}
@@ -352,6 +352,9 @@ def admin_sync():
             settings["gmail_config"] = data["gmail_config"]
         if isinstance(data.get("medical_reminders"), dict):
             settings["medical_reminders"] = data["medical_reminders"]
+        # Also persist SMS / mobile notification config centrally, so Android can read it too.
+        if isinstance(data.get("sms_config"), dict):
+            settings["sms_config"] = data["sms_config"]
         if not db.upsert_alert_settings(duid, settings):
             return jsonify({"message": "Failed to save alert settings"}), 500
     notify_databus(access_code)
@@ -360,7 +363,7 @@ def admin_sync():
 
 @app.route("/admin/notify", methods=["POST"])
 def admin_notify():
-    """POST { "access_code": "..." } → tell data bus to push latest admin data to connected clients (WebSocket)."""
+    """POST { "access_code": "..." } â†’ tell data bus to push latest admin data to connected clients (WebSocket)."""
     data = request.get_json(silent=True) or {}
     access_code = (data.get("access_code") or "").strip()
     if not access_code:
@@ -371,7 +374,7 @@ def admin_notify():
 
 @app.route("/admin", methods=["DELETE"])
 def delete_admin():
-    """DELETE /admin with JSON { "access_code": "..." } → delete that admin from Central DB.
+    """DELETE /admin with JSON { "access_code": "..." } â†’ delete that admin from Central DB.
     Frees access_code and connection_code so they can be allotted to new admins. Called by desktop when user deletes admin.
     """
     data = request.get_json(silent=True) or {}
@@ -428,6 +431,176 @@ def put_admin_medical_reminders():
     return jsonify({"message": "ok", "medical_reminders": medical_reminders})
 
 
+
+
+def _resolve_admin_from_access_code(db, access_code):
+    """Validate access code and return (admin_id, error_response_or_None)."""
+    code = (access_code or "").strip()
+    if not code:
+        return None, (jsonify({"message": "access_code required"}), 400)
+    result = db.get_role_by_access_code(code)
+    if not result:
+        return None, (jsonify({"message": "Invalid access code"}), 404)
+    role, admin_id = result
+    if role != "admin":
+        return None, (jsonify({"message": "Access code is not for admin"}), 403)
+    return admin_id, None
+
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+@app.route("/admin/medicines", methods=["PUT"])
+@app.route("/admin/inventory", methods=["PUT"])
+def put_admin_medicines():
+    """PUT { access_code, medicines:[{name,box_id,quantity,low_stock,dosage,times,expiry}] }.
+    Updates admin dashboard medicines (B1..B6) without touching dose_logs.
+    """
+    data = request.get_json(silent=True) or {}
+    access_code = (data.get("access_code") or "").strip()
+    medicines = data.get("medicines")
+
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+
+    admin_id, err = _resolve_admin_from_access_code(db, access_code)
+    if err:
+        return err
+
+    if not isinstance(medicines, list):
+        return jsonify({"message": "medicines must be a list"}), 400
+
+    duid = db.get_dashboard_user_id(admin_id)
+    if not duid:
+        return jsonify({"message": "Dashboard user not found"}), 500
+
+    desired = {}
+    for m in medicines:
+        if not isinstance(m, dict):
+            continue
+        box_id = (m.get("box_id") or "").strip().upper()
+        if box_id not in {"B1", "B2", "B3", "B4", "B5", "B6"}:
+            continue
+
+        name = (m.get("name") or "").strip() or "Medicine"
+        qty = max(0, _safe_int(m.get("quantity"), 0))
+        low_stock = max(0, _safe_int(m.get("low_stock"), 5))
+        dosage = (m.get("dosage") or "").strip()
+
+        times = m.get("times")
+        if isinstance(times, list):
+            times = [str(t).strip() for t in times if str(t).strip()]
+        elif isinstance(times, str) and times.strip():
+            times = [times.strip()]
+        else:
+            exact_time = (m.get("exact_time") or "").strip()
+            times = [exact_time] if exact_time else []
+
+        desired[box_id] = {
+            "name": name,
+            "box_id": box_id,
+            "quantity": qty,
+            "low_stock": low_stock,
+            "dosage": dosage,
+            "times": times,
+        }
+
+    existing = db.list_medicines(duid)
+    by_box = { (e.get("box_id") or "").strip().upper(): e for e in existing if isinstance(e, dict) }
+
+    for box_id in ["B1", "B2", "B3", "B4", "B5", "B6"]:
+        incoming = desired.get(box_id)
+        current = by_box.get(box_id)
+
+        if incoming:
+            if current:
+                ok = db.update_medicine(
+                    current.get("id"),
+                    name=incoming["name"],
+                    box_id=box_id,
+                    dosage=incoming["dosage"],
+                    times=incoming["times"],
+                    low_stock=incoming["low_stock"],
+                    quantity=incoming["quantity"],
+                )
+                if not ok:
+                    return jsonify({"message": f"Failed to update {box_id}"}), 500
+            else:
+                mid = db.create_medicine(
+                    duid,
+                    incoming["name"],
+                    box_id=box_id,
+                    dosage=incoming["dosage"],
+                    times=incoming["times"],
+                    low_stock=incoming["low_stock"],
+                    quantity=incoming["quantity"],
+                )
+                if not mid:
+                    return jsonify({"message": f"Failed to create {box_id}"}), 500
+        else:
+            if current:
+                ok = db.delete_medicine(current.get("id"))
+                if not ok:
+                    return jsonify({"message": f"Failed to delete {box_id}"}), 500
+
+    notify_databus(access_code)
+    return jsonify({"message": "ok", "saved_boxes": len(desired)})
+
+
+@app.route("/admin/alert_settings", methods=["PUT"])
+@app.route("/admin/settings", methods=["PUT"])
+def put_admin_alert_settings():
+    """PUT { access_code, alert_settings?, gmail_config?, medical_reminders? }.
+    Saves settings under dashboard user's alert_settings JSON and notifies databus.
+    """
+    data = request.get_json(silent=True) or {}
+    access_code = (data.get("access_code") or "").strip()
+
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+
+    admin_id, err = _resolve_admin_from_access_code(db, access_code)
+    if err:
+        return err
+
+    duid = db.get_dashboard_user_id(admin_id)
+    if not duid:
+        return jsonify({"message": "Dashboard user not found"}), 500
+
+    current = db.get_alert_settings(duid) or {}
+    if not isinstance(current, dict):
+        current = {}
+
+    incoming_alert = data.get("alert_settings")
+    incoming_gmail = data.get("gmail_config")
+    incoming_reminders = data.get("medical_reminders")
+
+    # Backward compatibility: if client sends direct alert_settings object fields at top-level.
+    if not isinstance(incoming_alert, dict):
+        direct_keys = {"medicine_alerts", "missed_dose_escalation", "stock_alerts", "expiry_alerts"}
+        top = {k: data.get(k) for k in direct_keys if isinstance(data.get(k), dict)}
+        if top:
+            incoming_alert = top
+
+    if isinstance(incoming_alert, dict):
+        current["alert_settings"] = incoming_alert
+    if isinstance(incoming_gmail, dict):
+        current["gmail_config"] = incoming_gmail
+    if isinstance(incoming_reminders, dict):
+        current["medical_reminders"] = incoming_reminders
+
+    ok = db.upsert_alert_settings(duid, current)
+    if not ok:
+        return jsonify({"message": "Failed to save settings"}), 500
+
+    notify_databus(access_code)
+    return jsonify({"message": "ok", "settings": current})
 # ---- Medicines ----
 @app.route("/medicines", methods=["GET"])
 def list_medicines():
