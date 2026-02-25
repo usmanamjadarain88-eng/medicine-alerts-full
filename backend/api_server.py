@@ -149,7 +149,7 @@ def health():
 # ---- Auth / credentials ----
 @app.route("/save-credentials", methods=["POST"])
 def save_credentials():
-    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } â†’ admins or users.
+    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } Ã¢â€ â€™ admins or users.
     If role=admin and access_code is sent, update that admin's bot_id/api_key (so app links to desktop-created admin).
     """
     data = request.get_json() or {}
@@ -189,7 +189,7 @@ def save_credentials():
 
 @app.route("/connect-to-admin", methods=["POST"])
 def connect_to_admin():
-    """POST { connection_code, bot_id, api_key, name? } â†’ link this app (user) to the admin with that connection_code.
+    """POST { connection_code, bot_id, api_key, name? } Ã¢â€ â€™ link this app (user) to the admin with that connection_code.
     Backend creates/updates user row with this admin_id and bot_id+api_key. Returns admin_id on success.
     """
     data = request.get_json() or {}
@@ -259,7 +259,7 @@ def get_role():
 
 @app.route("/admin/data", methods=["GET"])
 def admin_data():
-    """GET /admin/data?access_code=...&last_sync_time=... (optional) â†’ dashboard data.
+    """GET /admin/data?access_code=...&last_sync_time=... (optional) Ã¢â€ â€™ dashboard data.
     If last_sync_time (ISO) is sent, only data updated after that time is returned (incremental). Always returns server_time.
     """
     access_code = (request.args.get("access_code") or "").strip()
@@ -289,11 +289,15 @@ def admin_data():
         "server_time": data.get("server_time") or "",
         "incremental": bool(data.get("incremental")),
     }
+    settings_obj = out["alert_settings"] if isinstance(out["alert_settings"], dict) else {}
+    medicine_meta = settings_obj.get("medicine_meta") if isinstance(settings_obj.get("medicine_meta"), dict) else {}
+
     for m in out["medicines"]:
         if "times" not in m or m["times"] is None:
             m["times"] = []
         elif not isinstance(m["times"], list):
             m["times"] = list(m["times"]) if hasattr(m["times"], "__iter__") and not isinstance(m["times"], str) else []
+
         if "quantity" not in m or m["quantity"] is None:
             m["quantity"] = 0
         else:
@@ -301,6 +305,23 @@ def admin_data():
                 m["quantity"] = int(m["quantity"])
             except (TypeError, ValueError):
                 m["quantity"] = 0
+
+        box_id = (m.get("box_id") or "").strip().upper()
+        meta = medicine_meta.get(box_id) if box_id else None
+        if not isinstance(meta, dict):
+            meta = {}
+
+        exact_time = (meta.get("exact_time") or "").strip() or (m["times"][0] if m["times"] else "08:00")
+        dose_per_day = _safe_int(meta.get("dose_per_day"), 0)
+        if dose_per_day <= 0:
+            dose_per_day = max(1, len(m["times"]))
+        instructions = (meta.get("instructions") or m.get("dosage") or "").strip()
+        expiry = (meta.get("expiry") or "").strip()
+
+        m["exact_time"] = exact_time
+        m["dose_per_day"] = dose_per_day
+        m["instructions"] = instructions
+        m["expiry"] = expiry
     if data.get("medicine_box_ids") is not None:
         out["medicine_box_ids"] = data["medicine_box_ids"]
     n_meds = len(out["medicines"])
@@ -355,6 +376,21 @@ def admin_sync():
         # Also persist SMS / mobile notification config centrally, so Android can read it too.
         if isinstance(data.get("sms_config"), dict):
             settings["sms_config"] = data["sms_config"]
+
+        # Persist rich medicine metadata from desktop payload so Android and desktop stay field-aligned.
+        incoming_meta = _extract_medicine_meta_from_boxes(medicine_boxes)
+        existing_meta = settings.get("medicine_meta") if isinstance(settings.get("medicine_meta"), dict) else {}
+        merged_meta = {}
+        for box in [f"B{i}" for i in range(1, 7)]:
+            if box in (medicine_boxes or {}):
+                if isinstance((medicine_boxes or {}).get(box), dict) and box in incoming_meta:
+                    merged_meta[box] = incoming_meta[box]
+                # Box explicitly provided but empty -> remove metadata for that box.
+            elif box in existing_meta:
+                # Box omitted from payload -> keep previous metadata.
+                merged_meta[box] = existing_meta[box]
+        settings["medicine_meta"] = merged_meta
+
         if not db.upsert_alert_settings(duid, settings):
             return jsonify({"message": "Failed to save alert settings"}), 500
     notify_databus(access_code)
@@ -363,7 +399,7 @@ def admin_sync():
 
 @app.route("/admin/notify", methods=["POST"])
 def admin_notify():
-    """POST { "access_code": "..." } â†’ tell data bus to push latest admin data to connected clients (WebSocket)."""
+    """POST { "access_code": "..." } Ã¢â€ â€™ tell data bus to push latest admin data to connected clients (WebSocket)."""
     data = request.get_json(silent=True) or {}
     access_code = (data.get("access_code") or "").strip()
     if not access_code:
@@ -374,7 +410,7 @@ def admin_notify():
 
 @app.route("/admin", methods=["DELETE"])
 def delete_admin():
-    """DELETE /admin with JSON { "access_code": "..." } â†’ delete that admin from Central DB.
+    """DELETE /admin with JSON { "access_code": "..." } Ã¢â€ â€™ delete that admin from Central DB.
     Frees access_code and connection_code so they can be allotted to new admins. Called by desktop when user deletes admin.
     """
     data = request.get_json(silent=True) or {}
@@ -454,6 +490,66 @@ def _safe_int(value, default):
         return default
 
 
+def _extract_medicine_meta_from_medicines(medicines):
+    """Build medicine metadata map keyed by box_id (B1..B6) from medicines payload."""
+    meta = {}
+    if not isinstance(medicines, list):
+        return meta
+    for m in medicines:
+        if not isinstance(m, dict):
+            continue
+        box_id = (m.get("box_id") or "").strip().upper()
+        if box_id not in {"B1", "B2", "B3", "B4", "B5", "B6"}:
+            continue
+
+        times = m.get("times")
+        if isinstance(times, list):
+            times = [str(t).strip() for t in times if str(t).strip()]
+        elif isinstance(times, str) and times.strip():
+            times = [times.strip()]
+        else:
+            times = []
+
+        exact_time = (m.get("exact_time") or "").strip() or (times[0] if times else "08:00")
+        dose_per_day = _safe_int(m.get("dose_per_day"), 0)
+        if dose_per_day <= 0:
+            dose_per_day = max(1, len(times))
+        instructions = (m.get("instructions") or m.get("dosage") or "").strip()
+        expiry = (m.get("expiry") or "").strip()
+
+        meta[box_id] = {
+            "dose_per_day": dose_per_day,
+            "exact_time": exact_time,
+            "instructions": instructions,
+            "expiry": expiry,
+        }
+    return meta
+
+
+def _extract_medicine_meta_from_boxes(medicine_boxes):
+    """Build medicine metadata map keyed by box_id (B1..B6) from desktop medicine_boxes payload."""
+    meta = {}
+    if not isinstance(medicine_boxes, dict):
+        return meta
+    for box_id in [f"B{i}" for i in range(1, 7)]:
+        med = medicine_boxes.get(box_id)
+        if not isinstance(med, dict):
+            continue
+        exact_time = (med.get("exact_time") or "").strip() or "08:00"
+        dose_per_day = _safe_int(med.get("dose_per_day"), 1)
+        if dose_per_day <= 0:
+            dose_per_day = 1
+        instructions = (med.get("instructions") or "").strip()
+        expiry = (med.get("expiry") or "").strip()
+        meta[box_id] = {
+            "dose_per_day": dose_per_day,
+            "exact_time": exact_time,
+            "instructions": instructions,
+            "expiry": expiry,
+        }
+    return meta
+
+
 @app.route("/admin/medicines", methods=["PUT"])
 @app.route("/admin/inventory", methods=["PUT"])
 def put_admin_medicines():
@@ -480,6 +576,8 @@ def put_admin_medicines():
         return jsonify({"message": "Dashboard user not found"}), 500
 
     desired = {}
+    meta_payload = _extract_medicine_meta_from_medicines(medicines)
+
     for m in medicines:
         if not isinstance(m, dict):
             continue
@@ -490,7 +588,13 @@ def put_admin_medicines():
         name = (m.get("name") or "").strip() or "Medicine"
         qty = max(0, _safe_int(m.get("quantity"), 0))
         low_stock = max(0, _safe_int(m.get("low_stock"), 5))
-        dosage = (m.get("dosage") or "").strip()
+
+        meta = meta_payload.get(box_id) or {}
+        instructions = (meta.get("instructions") or m.get("dosage") or "").strip()
+        exact_time = (meta.get("exact_time") or "").strip() or "08:00"
+        dose_per_day = _safe_int(meta.get("dose_per_day"), 1)
+        if dose_per_day <= 0:
+            dose_per_day = 1
 
         times = m.get("times")
         if isinstance(times, list):
@@ -498,15 +602,16 @@ def put_admin_medicines():
         elif isinstance(times, str) and times.strip():
             times = [times.strip()]
         else:
-            exact_time = (m.get("exact_time") or "").strip()
-            times = [exact_time] if exact_time else []
+            times = []
+        if not times:
+            times = [exact_time] * dose_per_day
 
         desired[box_id] = {
             "name": name,
             "box_id": box_id,
             "quantity": qty,
             "low_stock": low_stock,
-            "dosage": dosage,
+            "dosage": instructions,
             "times": times,
         }
 
@@ -547,6 +652,18 @@ def put_admin_medicines():
                 ok = db.delete_medicine(current.get("id"))
                 if not ok:
                     return jsonify({"message": f"Failed to delete {box_id}"}), 500
+
+    settings = db.get_alert_settings(duid) or {}
+    if not isinstance(settings, dict):
+        settings = {}
+    existing_meta = settings.get("medicine_meta") if isinstance(settings.get("medicine_meta"), dict) else {}
+    merged_meta = {}
+    for box in ["B1", "B2", "B3", "B4", "B5", "B6"]:
+        if box in desired:
+            merged_meta[box] = meta_payload.get(box, {})
+    settings["medicine_meta"] = merged_meta
+    if not db.upsert_alert_settings(duid, settings):
+        return jsonify({"message": "Failed to save medicine metadata"}), 500
 
     notify_databus(access_code)
     return jsonify({"message": "ok", "saved_boxes": len(desired)})
@@ -776,3 +893,5 @@ if __name__ == "__main__":
         print("Database connection: FAILED - /admin/sync and /admin/data will return 503")
     print("")
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
+
+
