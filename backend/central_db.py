@@ -295,14 +295,23 @@ class CentralDB:
             cur.close()
 
     def delete_admin_by_access_code(self, access_code):
-        """Delete the admin (and cascade: users, medicines, dose_logs, alert_settings, alerts) so access_code and connection_code are freed for new admins."""
+        """Delete the full admin identity: find admin by access_code, then delete ALL admins with that email (and cascade: users, medicines, dose_logs, alert_settings, alerts). One click = full remove from DB."""
         code = (access_code or "").strip().upper()
         if not code:
             return False
         conn = self._ensure_conn()
         cur = conn.cursor()
         try:
-            cur.execute("DELETE FROM admins WHERE admin_access_code = %s", (code,))
+            cur.execute("SELECT email FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            email_val = (row[0] or "").strip()
+            # Delete all admin rows for this email (same identity; may have been created from desktop + app with different access_codes)
+            if email_val:
+                cur.execute("DELETE FROM admins WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s))", (email_val,))
+            else:
+                cur.execute("DELETE FROM admins WHERE admin_access_code = %s", (code,))
             conn.commit()
             return cur.rowcount > 0
         except Exception as e:
@@ -444,6 +453,60 @@ class CentralDB:
         except Exception as e:
             print(f"CentralDB get_user_by_admin_id: {e}")
             return None
+        finally:
+            cur.close()
+
+    def get_all_users_by_admin_id(self, admin_id):
+        """Return all real users linked to this admin (excludes the 'dashboard' system user)."""
+        if not admin_id:
+            return []
+        try:
+            uuid.UUID(str(admin_id))
+        except (ValueError, TypeError):
+            return []
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                (admin_id,),
+            )
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                if hasattr(row, "keys"):
+                    result.append({"id": str(row["id"]), "name": row["name"] or "", "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or ""})
+                else:
+                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
+            return result
+        except Exception as e:
+            print(f"CentralDB get_all_users_by_admin_id: {e}")
+            return []
+        finally:
+            cur.close()
+
+    def get_all_active_admins(self):
+        """Return list of {id, name, bot_id, api_key} for all admins. Used by the backend alert scheduler."""
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute("SELECT id, name, bot_id, api_key FROM admins ORDER BY created_at")
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                if hasattr(row, "keys"):
+                    result.append({
+                        "id": str(row["id"]),
+                        "name": row["name"] or "",
+                        "bot_id": row["bot_id"] or "",
+                        "api_key": row["api_key"] or "",
+                    })
+                else:
+                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
+            return result
+        except Exception as e:
+            print(f"CentralDB get_all_active_admins: {e}")
+            return []
         finally:
             cur.close()
 
