@@ -99,9 +99,8 @@ class CentralDB:
                 cur.close()
         return "C" + (secrets.token_hex(4).upper()[: _ADMIN_CODE_LENGTH - 1])  # fallback
 
-    # ---- Admins (from Admin Panel: bot_id + api_key) ----
     def _admin_id_by_email(self, email):
-        """Return admin id that has this email (normalized: strip + lower), or None. Used to enforce one admin per email."""
+        """Return admin id that has this email (normalized: strip + lower), or None."""
         raw = (email or "").strip()
         if not raw:
             return None
@@ -120,21 +119,19 @@ class CentralDB:
         finally:
             cur.close()
 
+    # ---- Admins (from Admin Panel: bot_id + api_key) ----
     def upsert_admin_from_bot(self, bot_id, api_key, name=None, email=None):
         """Insert or update admin by (bot_id, api_key). Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         New admins get unique admin_access_code and connection_code; existing admins keep their codes.
-        Raises EmailAlreadyUsedError if a non-empty email is already used by another admin (one admin per email until that admin is deleted).
-        When an access code is allotted, the admin has full permissions (is_admin=true).
         """
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
+        email_val = (email or "").strip()
         if not bot_id or not api_key:
             return None, None, None
-        email_val = (email or "").strip()
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            # If email is provided, ensure no other admin has it (same admin can keep their own email)
             if email_val:
                 existing_id = self._admin_id_by_email(email_val)
                 if existing_id:
@@ -184,8 +181,6 @@ class CentralDB:
     def update_admin_bot_by_access_code(self, access_code, bot_id, api_key, name=None, email=None):
         """Find admin by access_code and set their bot_id, api_key, name, email (e.g. when app registers).
         If another admin row has this (bot_id, api_key), delete it first so we keep one admin per access_code.
-        Raises EmailAlreadyUsedError if the new email is already used by another admin.
-        Access-code admins have full permissions (is_admin=true).
         Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         """
         code = (access_code or "").strip().upper()
@@ -295,7 +290,7 @@ class CentralDB:
             cur.close()
 
     def delete_admin_by_access_code(self, access_code):
-        """Delete the full admin identity: find admin by access_code, then delete ALL admins with that email (and cascade: users, medicines, dose_logs, alert_settings, alerts). One click = full remove from DB."""
+        """Delete full admin identity by access_code; removes all admins with same email."""
         code = (access_code or "").strip().upper()
         if not code:
             return False
@@ -307,7 +302,6 @@ class CentralDB:
             if not row:
                 return False
             email_val = (row[0] or "").strip()
-            # Delete all admin rows for this email (same identity; may have been created from desktop + app with different access_codes)
             if email_val:
                 cur.execute("DELETE FROM admins WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s))", (email_val,))
             else:
@@ -456,60 +450,6 @@ class CentralDB:
         finally:
             cur.close()
 
-    def get_all_users_by_admin_id(self, admin_id):
-        """Return all real users linked to this admin (excludes the 'dashboard' system user)."""
-        if not admin_id:
-            return []
-        try:
-            uuid.UUID(str(admin_id))
-        except (ValueError, TypeError):
-            return []
-        conn = self._ensure_conn()
-        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
-        try:
-            cur.execute(
-                "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
-                (admin_id,),
-            )
-            rows = cur.fetchall()
-            result = []
-            for row in rows:
-                if hasattr(row, "keys"):
-                    result.append({"id": str(row["id"]), "name": row["name"] or "", "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or ""})
-                else:
-                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
-            return result
-        except Exception as e:
-            print(f"CentralDB get_all_users_by_admin_id: {e}")
-            return []
-        finally:
-            cur.close()
-
-    def get_all_active_admins(self):
-        """Return list of {id, name, bot_id, api_key} for all admins. Used by the backend alert scheduler."""
-        conn = self._ensure_conn()
-        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
-        try:
-            cur.execute("SELECT id, name, bot_id, api_key FROM admins ORDER BY created_at")
-            rows = cur.fetchall()
-            result = []
-            for row in rows:
-                if hasattr(row, "keys"):
-                    result.append({
-                        "id": str(row["id"]),
-                        "name": row["name"] or "",
-                        "bot_id": row["bot_id"] or "",
-                        "api_key": row["api_key"] or "",
-                    })
-                else:
-                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
-            return result
-        except Exception as e:
-            print(f"CentralDB get_all_active_admins: {e}")
-            return []
-        finally:
-            cur.close()
-
     def get_user_id_by_bot(self, bot_id, api_key):
         """Return user UUID (string) for this bot_id+api_key, or None."""
         bot_id = (bot_id or "").strip()
@@ -609,7 +549,6 @@ class CentralDB:
         """
         duid = self.get_dashboard_user_id(admin_id)
         if not duid:
-            print(f"CentralDB sync_admin_dashboard_data: no dashboard user for admin_id={admin_id}")
             return False
         existing_medicines = self.list_medicines(duid)
         by_box = {m.get("box_id"): m for m in existing_medicines if m.get("box_id")}
@@ -660,6 +599,8 @@ class CentralDB:
         except Exception as e:
             conn.rollback()
             print(f"CentralDB sync_admin_dashboard_data delete dose_logs: {e}")
+            cur.close()
+            return True
         finally:
             cur.close()
 
@@ -1076,3 +1017,57 @@ class CentralDB:
             "alerts": alerts,
             "server_time": now,
         }
+
+    def get_all_users_by_admin_id(self, admin_id):
+        """Return all real users linked to this admin (excludes the dashboard system user)."""
+        if not admin_id:
+            return []
+        try:
+            uuid.UUID(str(admin_id))
+        except (ValueError, TypeError):
+            return []
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                (admin_id,),
+            )
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                if hasattr(row, "keys"):
+                    result.append({"id": str(row["id"]), "name": row["name"] or "", "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or ""})
+                else:
+                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
+            return result
+        except Exception as e:
+            print(f"CentralDB get_all_users_by_admin_id: {e}")
+            return []
+        finally:
+            cur.close()
+
+    def get_all_active_admins(self):
+        """Return list of {id, name, bot_id, api_key} for all admins."""
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute("SELECT id, name, bot_id, api_key FROM admins ORDER BY created_at")
+            rows = cur.fetchall()
+            result = []
+            for row in rows:
+                if hasattr(row, "keys"):
+                    result.append({
+                        "id": str(row["id"]),
+                        "name": row["name"] or "",
+                        "bot_id": row["bot_id"] or "",
+                        "api_key": row["api_key"] or "",
+                    })
+                else:
+                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
+            return result
+        except Exception as e:
+            print(f"CentralDB get_all_active_admins: {e}")
+            return []
+        finally:
+            cur.close()
