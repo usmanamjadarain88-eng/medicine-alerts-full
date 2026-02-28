@@ -233,6 +233,35 @@ class CentralDB:
         finally:
             cur.close()
 
+    def get_admin_bot_by_access_code(self, access_code):
+        """Return { bot_id, api_key } for admin with this access_code, or None.
+        Used when desktop notifies backend of events (system_started, admin_login, dose_taken, etc.)
+        so backend can forward alerts to admin's app via relay."""
+        code = (access_code or "").strip().upper()
+        if not code:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute("SELECT bot_id, api_key FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
+            row = cur.fetchone()
+            if row and hasattr(row, "keys"):
+                bid = (row.get("bot_id") or "").strip()
+                akey = (row.get("api_key") or "").strip()
+                if bid and akey:
+                    return {"bot_id": bid, "api_key": akey}
+            if row:
+                bid = (row[0] or "").strip()
+                akey = (row[1] or "").strip()
+                if bid and akey:
+                    return {"bot_id": bid, "api_key": akey}
+            return None
+        except Exception as e:
+            print(f"CentralDB get_admin_bot_by_access_code: {e}")
+            return None
+        finally:
+            cur.close()
+
     def get_admin_by_access_code(self, access_code):
         """Return admin row { id, name, admin_access_code, connection_code } for this access code, or None.
         Used by Android app: enter code → identify as admin.
@@ -369,9 +398,39 @@ class CentralDB:
             cur.close()
 
     # ---- Users (from System Settings: bot_id + api_key, linked to admin_id) ----
-    def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None):
+    def _delete_other_users_by_admin_and_email(self, admin_id, email, keep_bot_id, keep_api_key):
+        """Remove any other user rows for this admin_id + email (different device/install). Keeps the row for (keep_bot_id, keep_api_key)."""
+        email = (email or "").strip()
+        if not email:
+            return
+        try:
+            uuid.UUID(str(admin_id))
+        except (ValueError, TypeError):
+            return
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                DELETE FROM users
+                WHERE admin_id = %s::uuid AND LOWER(TRIM(email)) = LOWER(TRIM(%s))
+                AND (bot_id != %s OR api_key != %s)
+                """,
+                (admin_id, email, keep_bot_id, keep_api_key),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            # Ignore if email column does not exist yet (run: ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255))
+            if "column" not in str(e).lower() and "email" not in str(e).lower():
+                print(f"CentralDB _delete_other_users_by_admin_and_email: {e}")
+        finally:
+            cur.close()
+
+    def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None):
         """Insert or update the user by (bot_id, api_key); links this app to the given admin_id. Returns user id or None.
-        Many users (app instances) can link to the same admin. Unique key is (bot_id, api_key).
+        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first,
+        so the same person re-signing up gets only one row (current credentials).
         """
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
@@ -381,20 +440,25 @@ class CentralDB:
             uuid.UUID(str(admin_id))
         except (ValueError, TypeError):
             return None
+        email_clean = (email or "").strip()
+        if email_clean:
+            self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key)
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
+            # Schema: users may have email column (added later); use COALESCE for compatibility
             cur.execute(
                 """
-                INSERT INTO users (admin_id, name, bot_id, api_key, role, updated_at)
-                VALUES (%s::uuid, %s, %s, %s, 'user', NOW())
+                INSERT INTO users (admin_id, name, email, bot_id, api_key, role, updated_at)
+                VALUES (%s::uuid, %s, %s, %s, %s, 'user', NOW())
                 ON CONFLICT (bot_id, api_key)
                 DO UPDATE SET admin_id = EXCLUDED.admin_id,
                               name = COALESCE(EXCLUDED.name, users.name),
+                              email = COALESCE(EXCLUDED.email, users.email),
                               updated_at = NOW()
                 RETURNING id
                 """,
-                (admin_id, name or "", bot_id, api_key),
+                (admin_id, name or "", email_clean or None, bot_id, api_key),
             )
             row = cur.fetchone()
             conn.commit()
@@ -404,7 +468,31 @@ class CentralDB:
             return None
         except Exception as e:
             conn.rollback()
-            print(f"CentralDB upsert_user_from_bot: {e}")
+            # If email column doesn't exist yet, fallback to insert without email
+            if "email" in str(e).lower() or "column" in str(e).lower():
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO users (admin_id, name, bot_id, api_key, role, updated_at)
+                        VALUES (%s::uuid, %s, %s, %s, 'user', NOW())
+                        ON CONFLICT (bot_id, api_key)
+                        DO UPDATE SET admin_id = EXCLUDED.admin_id,
+                                      name = COALESCE(EXCLUDED.name, users.name),
+                                      updated_at = NOW()
+                        RETURNING id
+                        """,
+                        (admin_id, name or "", bot_id, api_key),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    if row:
+                        uid = row["id"] if hasattr(row, "keys") else row[0]
+                        return str(uid) if isinstance(uid, uuid.UUID) else uid
+                except Exception as e2:
+                    conn.rollback()
+                    print(f"CentralDB upsert_user_from_bot fallback: {e2}")
+            else:
+                print(f"CentralDB upsert_user_from_bot: {e}")
             return None
         finally:
             cur.close()
