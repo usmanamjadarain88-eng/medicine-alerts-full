@@ -99,6 +99,158 @@ class CentralDB:
                 cur.close()
         return "C" + (secrets.token_hex(4).upper()[: _ADMIN_CODE_LENGTH - 1])  # fallback
 
+    def create_desktop_link_code(self, access_code, expires_seconds=300):
+        """Admin creates a one-time code for a user to link desktop to this admin (user view). Code valid 5 min; one-time use. Returns (code, admin_id, admin_name) or (None, None, None)."""
+        code = (access_code or "").strip().upper()
+        if not code:
+            return None, None, None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT id, name FROM admins WHERE admin_access_code = %s LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None, None, None
+            admin_id = row["id"] if hasattr(row, "keys") else row[0]
+            admin_name = (row["name"] if hasattr(row, "keys") else row[1]) or "Admin"
+            from datetime import timedelta
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
+            for _ in range(20):
+                link_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+                try:
+                    cur.execute(
+                        "INSERT INTO desktop_link_codes (code, admin_id, expires_at) VALUES (%s, %s, %s)",
+                        (link_code, admin_id, expires_at),
+                    )
+                    if cur.rowcount:
+                        conn.commit()
+                        return link_code, str(admin_id), admin_name
+                except Exception:
+                    conn.rollback()
+                    continue
+            return None, None, None
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB create_desktop_link_code: {e}")
+            return None, None, None
+        finally:
+            cur.close()
+
+    def get_admin_by_desktop_link_code(self, code):
+        """Validate desktop link code, return admin info and consume the code. Returns { admin_id, admin_name } or None."""
+        code = (code or "").strip().upper()
+        if not code:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT d.admin_id, a.name FROM desktop_link_codes d JOIN admins a ON a.id = d.admin_id WHERE d.code = %s AND d.expires_at > NOW() LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            admin_id = row["admin_id"] if hasattr(row, "keys") else row[0]
+            admin_name = (row["name"] if hasattr(row, "keys") else row[1]) or "Admin"
+            cur.execute("DELETE FROM desktop_link_codes WHERE code = %s", (code,))
+            conn.commit()
+            return {"admin_id": str(admin_id), "admin_name": admin_name}
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB get_admin_by_desktop_link_code: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def create_user_desktop_link_code(self, bot_id, api_key, expires_seconds=300):
+        """User (app) creates a one-time code for desktop to link to this user. Code valid 5 min; one-time use. Returns (code, user_id, user_name) or (None, None, None)."""
+        bot_id = (bot_id or "").strip()
+        api_key = (api_key or "").strip()
+        if not bot_id or not api_key:
+            return None, None, None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT id, name FROM users WHERE bot_id = %s AND api_key = %s LIMIT 1",
+                (bot_id, api_key),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None, None, None
+            user_id = row["id"] if hasattr(row, "keys") else row[0]
+            user_name = (row["name"] if hasattr(row, "keys") else row[1]) or "User"
+            from datetime import timedelta
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_seconds)
+            for _ in range(20):
+                link_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+                try:
+                    cur.execute(
+                        "INSERT INTO user_desktop_link_codes (code, user_id, expires_at) VALUES (%s, %s, %s)",
+                        (link_code, user_id, expires_at),
+                    )
+                    if cur.rowcount:
+                        conn.commit()
+                        return link_code, str(user_id), user_name
+                except Exception:
+                    conn.rollback()
+                    continue
+            return None, None, None
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB create_user_desktop_link_code: {e}")
+            return None, None, None
+        finally:
+            cur.close()
+
+    def get_user_by_desktop_link_code(self, code):
+        """Validate user desktop link code, return user info and admin info; consume the code.
+        Returns { user_id, user_name, bot_id, api_key, admin_id, admin_name } or None.
+        Backend knows which user this code was given to (user created it in app)."""
+        code = (code or "").strip().upper()
+        if not code:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                """SELECT d.user_id, u.name AS user_name, u.bot_id, u.api_key, u.admin_id, a.name AS admin_name
+                   FROM user_desktop_link_codes d
+                   JOIN users u ON u.id = d.user_id
+                   JOIN admins a ON a.id = u.admin_id
+                   WHERE d.code = %s AND d.expires_at > NOW() LIMIT 1""",
+                (code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            user_id = row["user_id"] if hasattr(row, "keys") else row[0]
+            user_name = (row["user_name"] if hasattr(row, "keys") else row[1]) or "User"
+            bot_id = (row["bot_id"] if hasattr(row, "keys") else row[2]) or ""
+            api_key = (row["api_key"] if hasattr(row, "keys") else row[3]) or ""
+            admin_id = row["admin_id"] if hasattr(row, "keys") else row[4]
+            admin_name = (row["admin_name"] if hasattr(row, "keys") else row[5]) or "Admin"
+            cur.execute("DELETE FROM user_desktop_link_codes WHERE code = %s", (code,))
+            conn.commit()
+            return {
+                "user_id": str(user_id),
+                "user_name": user_name,
+                "bot_id": bot_id,
+                "api_key": api_key,
+                "admin_id": str(admin_id) if admin_id else "",
+                "admin_name": admin_name,
+            }
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB get_user_by_desktop_link_code: {e}")
+            return None
+        finally:
+            cur.close()
+
     def _admin_id_by_email(self, email):
         """Return admin id that has this email (normalized: strip + lower), or None."""
         raw = (email or "").strip()
@@ -120,13 +272,15 @@ class CentralDB:
             cur.close()
 
     # ---- Admins (from Admin Panel: bot_id + api_key) ----
-    def upsert_admin_from_bot(self, bot_id, api_key, name=None, email=None):
+    def upsert_admin_from_bot(self, bot_id, api_key, name=None, email=None, fcm_token=None):
         """Insert or update admin by (bot_id, api_key). Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         New admins get unique admin_access_code and connection_code; existing admins keep their codes.
+        fcm_token: when provided, stored so backend can send push alerts to this admin.
         """
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
         email_val = (email or "").strip()
+        fcm = (fcm_token or "").strip() or None
         if not bot_id or not api_key:
             return None, None, None
         conn = self._ensure_conn()
@@ -147,18 +301,19 @@ class CentralDB:
             connection_code = self._generate_connection_code()
             cur.execute(
                 """
-                INSERT INTO admins (name, email, bot_id, api_key, admin_access_code, connection_code, is_admin, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, true, NOW())
+                INSERT INTO admins (name, email, bot_id, api_key, admin_access_code, connection_code, fcm_token, is_admin, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, true, NOW())
                 ON CONFLICT (bot_id, api_key)
                 DO UPDATE SET name = COALESCE(EXCLUDED.name, admins.name),
                               email = COALESCE(EXCLUDED.email, admins.email),
                               admin_access_code = COALESCE(admins.admin_access_code, EXCLUDED.admin_access_code),
                               connection_code = COALESCE(admins.connection_code, EXCLUDED.connection_code),
+                              fcm_token = COALESCE(NULLIF(TRIM(EXCLUDED.fcm_token), ''), admins.fcm_token),
                               is_admin = true,
                               updated_at = NOW()
                 RETURNING id, admin_access_code, connection_code
                 """,
-                (name or "", email_val or "", bot_id, api_key, access_code, connection_code),
+                (name or "", email_val or "", bot_id, api_key, access_code, connection_code, fcm),
             )
             row = cur.fetchone()
             conn.commit()
@@ -178,8 +333,8 @@ class CentralDB:
         finally:
             cur.close()
 
-    def update_admin_bot_by_access_code(self, access_code, bot_id, api_key, name=None, email=None):
-        """Find admin by access_code and set their bot_id, api_key, name, email (e.g. when app registers).
+    def update_admin_bot_by_access_code(self, access_code, bot_id, api_key, name=None, email=None, fcm_token=None):
+        """Find admin by access_code and set their bot_id, api_key, name, email, fcm_token (e.g. when app registers).
         If another admin row has this (bot_id, api_key), delete it first so we keep one admin per access_code.
         Returns (admin_id, admin_access_code, connection_code) or (None, None, None).
         """
@@ -206,14 +361,15 @@ class CentralDB:
                 "DELETE FROM admins WHERE bot_id = %s AND api_key = %s AND id != %s::uuid",
                 (bot_id, api_key, target_id),
             )
+            fcm = (fcm_token or "").strip() or None
             cur.execute(
                 """
                 UPDATE admins SET bot_id = %s, api_key = %s, name = COALESCE(NULLIF(%s, ''), name),
-                email = COALESCE(NULLIF(%s, ''), email), is_admin = true, updated_at = NOW()
+                email = COALESCE(NULLIF(%s, ''), email), fcm_token = COALESCE(NULLIF(%s, ''), fcm_token), is_admin = true, updated_at = NOW()
                 WHERE admin_access_code = %s
                 RETURNING id, admin_access_code, connection_code
                 """,
-                (bot_id, api_key, name or "", email_val or "", code),
+                (bot_id, api_key, name or "", email_val or "", fcm or "", code),
             )
             row = cur.fetchone()
             conn.commit()
@@ -319,18 +475,36 @@ class CentralDB:
             cur.close()
 
     def delete_admin_by_access_code(self, access_code):
-        """Delete full admin identity by access_code; removes all admins with same email."""
+        """Delete admin and all data for that admin: users (and their medicines, dose_logs, alert_settings, alerts), sync_logs. DB is empty for this admin."""
         code = (access_code or "").strip().upper()
         if not code:
             return False
         conn = self._ensure_conn()
         cur = conn.cursor()
         try:
-            cur.execute("SELECT email FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
+            cur.execute("SELECT id, email FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
             row = cur.fetchone()
             if not row:
                 return False
-            email_val = (row[0] or "").strip()
+            admin_id = row[0]
+            email_val = (row[1] or "").strip() if len(row) > 1 else ""
+
+            # Get all admin_id(s) we are about to delete (this one, or all with same email)
+            if email_val:
+                cur.execute("SELECT id FROM admins WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s))", (email_val,))
+                admin_ids = [r[0] for r in cur.fetchall()]
+            else:
+                admin_ids = [admin_id]
+
+            # Delete sync_logs for any user belonging to these admins (sync_logs has no ON DELETE CASCADE on user_id)
+            if admin_ids:
+                placeholders = ",".join(["%s::uuid"] * len(admin_ids))
+                cur.execute(
+                    f"DELETE FROM sync_logs WHERE user_id IN (SELECT id FROM users WHERE admin_id IN ({placeholders}))",
+                    tuple(admin_ids),
+                )
+
+            # Delete admins; CASCADE will delete users -> medicines, dose_logs, alert_settings, alerts
             if email_val:
                 cur.execute("DELETE FROM admins WHERE LOWER(TRIM(email)) = LOWER(TRIM(%s))", (email_val,))
             else:
@@ -427,10 +601,10 @@ class CentralDB:
         finally:
             cur.close()
 
-    def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None):
+    def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None, fcm_token=None):
         """Insert or update the user by (bot_id, api_key); links this app to the given admin_id. Returns user id or None.
-        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first,
-        so the same person re-signing up gets only one row (current credentials).
+        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first.
+        fcm_token: when provided, stored for push alerts to this user.
         """
         bot_id = (bot_id or "").strip()
         api_key = (api_key or "").strip()
@@ -441,24 +615,26 @@ class CentralDB:
         except (ValueError, TypeError):
             return None
         email_clean = (email or "").strip()
+        fcm = (fcm_token or "").strip() or None
         if email_clean:
             self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key)
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            # Schema: users may have email column (added later); use COALESCE for compatibility
+            # Schema: users may have email, fcm_token columns
             cur.execute(
                 """
-                INSERT INTO users (admin_id, name, email, bot_id, api_key, role, updated_at)
-                VALUES (%s::uuid, %s, %s, %s, %s, 'user', NOW())
+                INSERT INTO users (admin_id, name, email, bot_id, api_key, role, fcm_token, updated_at)
+                VALUES (%s::uuid, %s, %s, %s, %s, 'user', %s, NOW())
                 ON CONFLICT (bot_id, api_key)
                 DO UPDATE SET admin_id = EXCLUDED.admin_id,
                               name = COALESCE(EXCLUDED.name, users.name),
                               email = COALESCE(EXCLUDED.email, users.email),
+                              fcm_token = COALESCE(NULLIF(TRIM(EXCLUDED.fcm_token), ''), users.fcm_token),
                               updated_at = NOW()
                 RETURNING id
                 """,
-                (admin_id, name or "", email_clean or None, bot_id, api_key),
+                (admin_id, name or "", email_clean or None, bot_id, api_key, fcm),
             )
             row = cur.fetchone()
             conn.commit()
@@ -468,8 +644,8 @@ class CentralDB:
             return None
         except Exception as e:
             conn.rollback()
-            # If email column doesn't exist yet, fallback to insert without email
-            if "email" in str(e).lower() or "column" in str(e).lower():
+            # If email/fcm_token column doesn't exist yet, fallback to insert without them
+            if "email" in str(e).lower() or "column" in str(e).lower() or "fcm_token" in str(e).lower():
                 try:
                     cur.execute(
                         """
@@ -558,6 +734,45 @@ class CentralDB:
             return None
         except Exception as e:
             print(f"CentralDB get_user_id_by_bot: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def get_user_and_admin_bot_by_user_bot(self, bot_id, api_key):
+        """Given a user's bot_id+api_key, return user_id, admin_id, user_name, and admin's bot_id/api_key for relaying alerts to admin. Returns dict or None."""
+        bot_id = (bot_id or "").strip()
+        api_key = (api_key or "").strip()
+        if not bot_id or not api_key:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                """SELECT u.id AS user_id, u.admin_id, u.name AS user_name, a.bot_id AS admin_bot_id, a.api_key AS admin_api_key
+                   FROM users u JOIN admins a ON a.id = u.admin_id
+                   WHERE u.bot_id = %s AND u.api_key = %s AND u.bot_id != 'dashboard' LIMIT 1""",
+                (bot_id, api_key),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            if hasattr(row, "keys"):
+                return {
+                    "user_id": str(row["user_id"]),
+                    "admin_id": str(row["admin_id"]),
+                    "user_name": (row["user_name"] or "").strip() or "User",
+                    "admin_bot_id": (row["admin_bot_id"] or "").strip(),
+                    "admin_api_key": (row["admin_api_key"] or "").strip(),
+                }
+            return {
+                "user_id": str(row[0]),
+                "admin_id": str(row[1]),
+                "user_name": (row[2] or "").strip() or "User",
+                "admin_bot_id": (row[3] or "").strip(),
+                "admin_api_key": (row[4] or "").strip(),
+            }
+        except Exception as e:
+            print(f"CentralDB get_user_and_admin_bot_by_user_bot: {e}")
             return None
         finally:
             cur.close()
@@ -699,6 +914,72 @@ class CentralDB:
             box = entry.get("box") or entry.get("box_id") or ""
             if ts:
                 self.create_dose_log(duid, medicine_id=None, box_id=box, taken_at=ts, source="desktop")
+        return True
+
+    def sync_admin_dashboard_data_for_user(self, admin_id, user_id, medicine_boxes, dose_log):
+        """Sync medicine_boxes and dose_log to a connected user (when admin 'acts as' that user)."""
+        if not self.user_belongs_to_admin(user_id, admin_id):
+            return False
+        existing_medicines = self.list_medicines(user_id)
+        by_box = {m.get("box_id"): m for m in existing_medicines if m.get("box_id")}
+
+        for box_id in [f"B{i}" for i in range(1, 7)]:
+            med = (medicine_boxes or {}).get(box_id) if isinstance(medicine_boxes, dict) else None
+            if med and isinstance(med, dict):
+                name = (med.get("name") or "").strip() or "Medicine"
+                dosage = med.get("instructions") or str(med.get("dose_per_day") or "")
+                exact_time = med.get("exact_time") or "08:00"
+                times = [exact_time] if isinstance(exact_time, str) else (exact_time if isinstance(exact_time, (list, tuple)) else [])
+                low_stock = 5
+                if med.get("low_stock") is not None:
+                    try:
+                        low_stock = int(med.get("low_stock"))
+                    except (TypeError, ValueError):
+                        pass
+                quantity = 0
+                if med.get("quantity") is not None:
+                    try:
+                        quantity = int(med.get("quantity"))
+                    except (TypeError, ValueError):
+                        pass
+                existing = by_box.get(box_id)
+                if existing:
+                    self.update_medicine(
+                        existing.get("id"),
+                        name=name,
+                        box_id=box_id,
+                        dosage=dosage,
+                        times=times,
+                        low_stock=low_stock,
+                        quantity=quantity,
+                    )
+                else:
+                    self.create_medicine(user_id, name, box_id=box_id, dosage=dosage, times=times, low_stock=low_stock, quantity=quantity)
+            else:
+                existing = by_box.get(box_id)
+                if existing:
+                    self.delete_medicine(existing.get("id"))
+
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("DELETE FROM dose_logs WHERE user_id = %s::uuid", (user_id,))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB sync_admin_dashboard_data_for_user delete dose_logs: {e}")
+            cur.close()
+            return True
+        finally:
+            cur.close()
+
+        for entry in (dose_log or [])[:500]:
+            if not isinstance(entry, dict):
+                continue
+            ts = entry.get("timestamp") or entry.get("taken_at")
+            box = entry.get("box") or entry.get("box_id") or ""
+            if ts:
+                self.create_dose_log(user_id, medicine_id=None, box_id=box, taken_at=ts, source="desktop")
         return True
 
     # ---- Medicines, dose_logs, alert_settings, alerts, get_sync (abbreviated for length - same as pyqt) ----
@@ -1134,6 +1415,113 @@ class CentralDB:
             return []
         finally:
             cur.close()
+
+    def user_belongs_to_admin(self, user_id, admin_id):
+        """True if user_id is a non-dashboard user under this admin_id."""
+        if not user_id or not admin_id:
+            return False
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT 1 FROM users WHERE id = %s::uuid AND admin_id = %s::uuid AND bot_id != 'dashboard' LIMIT 1",
+                (user_id, admin_id),
+            )
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+        finally:
+            cur.close()
+
+    def get_deleted_user_notification(self, bot_id, api_key):
+        """If this (bot_id, api_key) was deleted by admin, return dict with user_name and message; else None."""
+        bot_id = (bot_id or "").strip()
+        api_key = (api_key or "").strip()
+        if not bot_id or not api_key:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT user_name FROM deleted_user_notifications WHERE bot_id = %s AND api_key = %s LIMIT 1",
+                (bot_id, api_key),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            name = row["user_name"] if hasattr(row, "keys") else (row[0] if row else None)
+            return {"user_name": name or "User", "message": "The admin has removed you from their account."}
+        except Exception as e:
+            print(f"CentralDB get_deleted_user_notification: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def delete_user_by_admin(self, admin_id, user_id):
+        """Admin deletes a connected user. User cannot delete themselves; only admin can.
+        Records (bot_id, api_key) in deleted_user_notifications so get-role returns 410 for that user.
+        Returns (True, user_name) on success, (False, None) otherwise."""
+        if not self.user_belongs_to_admin(user_id, admin_id):
+            return False, None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute(
+                "SELECT bot_id, api_key, name FROM users WHERE id = %s::uuid LIMIT 1",
+                (user_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False, None
+            bot_id = row["bot_id"] if hasattr(row, "keys") else row[0]
+            api_key = row["api_key"] if hasattr(row, "keys") else row[1]
+            user_name = (row["name"] or "User") if hasattr(row, "keys") else (row[2] if len(row) > 2 else "User")
+            cur.execute(
+                "INSERT INTO deleted_user_notifications (bot_id, api_key, user_name) VALUES (%s, %s, %s) ON CONFLICT (bot_id, api_key) DO UPDATE SET user_name = EXCLUDED.user_name, deleted_at = NOW()",
+                (bot_id, api_key, user_name),
+            )
+            cur.execute("DELETE FROM users WHERE id = %s::uuid", (user_id,))
+            conn.commit()
+            return True, user_name
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB delete_user_by_admin: {e}")
+            return False, None
+        finally:
+            cur.close()
+
+    def get_user_data_for_admin(self, admin_id, user_id, last_sync_time=None):
+        """Return same shape as get_admin_dashboard_data but for the given user_id. Use when admin 'acts as' a connected user."""
+        if not self.user_belongs_to_admin(user_id, admin_id):
+            return None
+        now = datetime.now(timezone.utc).isoformat()
+        incremental = bool(last_sync_time and (last_sync_time or "").strip())
+        if incremental:
+            medicines = self.list_medicines(user_id, since=last_sync_time)
+            dose_logs = self.list_dose_logs(user_id, from_=last_sync_time, limit=500)
+            alert_settings = self.get_alert_settings_if_updated_since(user_id, last_sync_time)
+            alerts = self.list_alerts(admin_id=admin_id, user_id=user_id, since=last_sync_time, limit=200)
+        else:
+            medicines = self.list_medicines(user_id)
+            dose_logs = self.list_dose_logs(user_id, limit=500)
+            alert_settings = self.get_alert_settings(user_id)
+            alerts = self.list_alerts(admin_id=admin_id, user_id=user_id, limit=200)
+        medical_reminders = (alert_settings or {}).get("medical_reminders") if alert_settings else None
+        if medical_reminders is None and not incremental:
+            medical_reminders = {"appointments": [], "prescriptions": [], "lab_tests": [], "custom": []}
+        out = {
+            "medicines": medicines,
+            "dose_logs": dose_logs,
+            "alert_settings": alert_settings,
+            "alerts": alerts,
+            "medical_reminders": medical_reminders,
+            "server_time": now,
+            "incremental": incremental,
+        }
+        if incremental:
+            all_meds = self.list_medicines(user_id)
+            out["medicine_box_ids"] = [m.get("box_id") for m in all_meds if m.get("box_id")]
+        return out
 
     def get_all_active_admins(self):
         """Return list of {id, name, bot_id, api_key} for all admins."""
