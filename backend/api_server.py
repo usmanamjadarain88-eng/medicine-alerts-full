@@ -165,16 +165,22 @@ def save_credentials():
         return jsonify({"message": "Central DB not configured"}), 503
     if not bot_id or not api_key:
         return jsonify({"message": "bot_id and api_key required"}), 400
+    deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+    if deleted_info:
+        return jsonify({
+            "reason": "deleted_by_admin",
+            "message": deleted_info.get("message", "The admin has removed you from their account."),
+        }), 410
     if role == "admin":
         try:
             if access_code:
                 admin_id, admin_access_code, connection_code = db.update_admin_bot_by_access_code(
-                    access_code, bot_id, api_key, name=name, email=email
+                    access_code, bot_id, api_key, name=name, email=email, fcm_token=fcm_token or None
                 )
                 if admin_id:
                     notify_databus(admin_access_code or access_code)
                     return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
-            admin_id, admin_access_code, connection_code = db.upsert_admin_from_bot(bot_id, api_key, name=name, email=email)
+            admin_id, admin_access_code, connection_code = db.upsert_admin_from_bot(bot_id, api_key, name=name, email=email, fcm_token=fcm_token or None)
             if admin_access_code:
                 notify_databus(admin_access_code)
             return jsonify({"message": "ok", "admin_id": admin_id, "admin_access_code": admin_access_code or None, "connection_code": connection_code or None})
@@ -183,7 +189,7 @@ def save_credentials():
     admin_id = data.get("admin_id")
     if not admin_id:
         return jsonify({"message": "admin_id required for role=user"}), 400
-    user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name)
+    user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name, fcm_token=fcm_token or None)
     return jsonify({"message": "ok", "user_id": user_id})
 
 
@@ -263,6 +269,41 @@ def notify_event():
     return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
 
 
+@app.route("/notify-event-by-user", methods=["POST"])
+def notify_event_by_user():
+    """POST { bot_id, api_key, event_type, message } → from a user's desktop/app.
+    Backend finds that user's admin, sends alert to admin's app via relay, and creates an alert row so admin sees it in Alerts tab. Events: dose_taken, system_started, system_unlocked, etc."""
+    data = request.get_json() or {}
+    bot_id = (data.get("bot_id") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+    event_type = (data.get("event_type") or "alert").strip()
+    message = (data.get("message") or "").strip()
+    if not bot_id or not api_key:
+        return jsonify({"message": "bot_id and api_key required"}), 400
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    info = db.get_user_and_admin_bot_by_user_bot(bot_id, api_key)
+    if not info:
+        deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+        if deleted_info:
+            return jsonify({
+                "reason": "deleted_by_admin",
+                "message": deleted_info.get("message", "The admin has removed you from their account."),
+            }), 410
+        return jsonify({"message": "User not found or not linked to an admin"}), 404
+    admin_bot_id = info.get("admin_bot_id") or ""
+    admin_api_key = info.get("admin_api_key") or ""
+    if not admin_bot_id or not admin_api_key:
+        return jsonify({"message": "Admin app not registered yet"}), 404
+    ok = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message)
+    try:
+        db.create_alert(info["user_id"], info["admin_id"], event_type, message)
+    except Exception:
+        pass
+    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
+
+
 @app.route("/admin/linked-users", methods=["GET"])
 def get_linked_users():
     """GET /admin/linked-users?access_code=... -> list of users linked to this admin (excluding dashboard user)."""
@@ -280,6 +321,39 @@ def get_linked_users():
     return jsonify({"users": users})
 
 
+@app.route("/admin/users/<user_id>", methods=["DELETE"])
+def delete_admin_user(user_id):
+    """DELETE /admin/users/<user_id> with JSON { "access_code": "..." }. Only admin can delete a connected user.
+    User cannot delete themselves; deleted user is informed on next app/desktop request (410)."""
+    data = request.get_json(silent=True) or {}
+    access_code = (data.get("access_code") or request.args.get("access_code") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not access_code:
+        return jsonify({"message": "access_code required"}), 400
+    result = db.get_role_by_access_code(access_code)
+    if not result:
+        return jsonify({"message": "Invalid access code"}), 404
+    role, admin_id = result
+    if role != "admin":
+        return jsonify({"message": "Access code is not for admin"}), 403
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return jsonify({"message": "user_id required"}), 400
+    ok, user_name = db.delete_user_by_admin(admin_id, user_id)
+    if not ok:
+        return jsonify({"message": "User not found or not linked to this admin"}), 404
+    # Notify admin: create alert using dashboard user so it appears in admin alerts
+    try:
+        duid = db.get_dashboard_user_id(admin_id)
+        if duid:
+            db.create_alert(duid, admin_id, "user_removed", f"User {user_name or 'User'} was removed from your account.")
+    except Exception:
+        pass
+    return jsonify({"message": "User deleted", "user_name": user_name or "User"})
+
+
 @app.route("/verify-credentials", methods=["POST"])
 def verify_credentials():
     data = request.get_json() or {}
@@ -290,6 +364,13 @@ def verify_credentials():
         return jsonify({"role": None, "message": "Central DB not configured"}), 503
     result = db.get_role_by_bot(bot_id, api_key)
     if not result:
+        deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+        if deleted_info:
+            return jsonify({
+                "role": None,
+                "reason": "deleted_by_admin",
+                "message": deleted_info.get("message", "The admin has removed you from their account."),
+            }), 410
         return jsonify({"role": None, "message": "Invalid credentials"}), 401
     role, id_ = result
     return jsonify({"role": role, "message": "ok", "id": id_})
@@ -315,6 +396,13 @@ def get_role():
     api_key = (request.args.get("api_key") or "").strip()
     result = db.get_role_by_bot(bot_id, api_key)
     if not result:
+        deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+        if deleted_info:
+            return jsonify({
+                "role": None,
+                "reason": "deleted_by_admin",
+                "message": deleted_info.get("message", "The admin has removed you from their account."),
+            }), 410
         return jsonify({"role": None})
     role, id_ = result
     if role == "admin":
@@ -327,11 +415,11 @@ def get_role():
 
 @app.route("/admin/data", methods=["GET"])
 def admin_data():
-    """GET /admin/data?access_code=...&last_sync_time=... (optional) → dashboard data.
-    If last_sync_time (ISO) is sent, only data updated after that time is returned (incremental). Always returns server_time.
-    """
+    """GET /admin/data?access_code=...&last_sync_time=...&act_as_user_id=... (optional).
+    If act_as_user_id is set and belongs to this admin, returns that user's data (admin acting as that user)."""
     access_code = (request.args.get("access_code") or "").strip()
     last_sync_time = (request.args.get("last_sync_time") or "").strip() or None
+    act_as_user_id = (request.args.get("act_as_user_id") or "").strip() or None
     db = get_db()
     if not db:
         return jsonify({"message": "Central DB not configured"}), 503
@@ -343,7 +431,10 @@ def admin_data():
     role, admin_id = result
     if role != "admin":
         return jsonify({"message": "Access code is not for admin"}), 403
-    data = db.get_admin_dashboard_data(admin_id, last_sync_time=last_sync_time)
+    if act_as_user_id and db.user_belongs_to_admin(act_as_user_id, admin_id):
+        data = db.get_user_data_for_admin(admin_id, act_as_user_id, last_sync_time=last_sync_time)
+    else:
+        data = db.get_admin_dashboard_data(admin_id, last_sync_time=last_sync_time)
     if data is None:
         return jsonify({"message": "Failed to load admin data"}), 500
     # Normalize so app always gets same structure: lists are never None, each medicine has "times" as list
@@ -420,17 +511,24 @@ def admin_sync():
         return jsonify({"message": "Access code is not for admin"}), 403
     medicine_boxes = data.get("medicine_boxes") if isinstance(data.get("medicine_boxes"), dict) else {}
     dose_log = data.get("dose_log") if isinstance(data.get("dose_log"), list) else []
-    try:
-        ok = db.sync_admin_dashboard_data(admin_id, medicine_boxes, dose_log)
+    act_as_user_id = (data.get("act_as_user_id") or "").strip() or None
+    if act_as_user_id and not db.user_belongs_to_admin(act_as_user_id, admin_id):
+        act_as_user_id = None
+    if act_as_user_id:
+        ok = db.sync_admin_dashboard_data_for_user(admin_id, act_as_user_id, medicine_boxes, dose_log)
         if not ok:
-            print(f"  [admin/sync] sync_admin_dashboard_data returned False (dashboard user may be missing)")
-            return jsonify({"message": "Failed to write dashboard data (no dashboard user)"}), 500
-        n_boxes = sum(1 for b in (medicine_boxes or {}) if medicine_boxes.get(b))
-        print(f"  [admin/sync] saved {n_boxes} medicine box(es) for admin_id={admin_id}")
-    except Exception as e:
-        print(f"  [admin/sync] sync_admin_dashboard_data: {e}")
-        return jsonify({"message": "Failed to write dashboard data"}), 500
-    duid = db.get_dashboard_user_id(admin_id)
+            return jsonify({"message": "Failed to write user data"}), 500
+        duid = act_as_user_id
+    else:
+        try:
+            ok = db.sync_admin_dashboard_data(admin_id, medicine_boxes, dose_log)
+            if not ok:
+                print(f"  [admin/sync] sync_admin_dashboard_data returned False (dashboard user may be missing)")
+                return jsonify({"message": "Failed to write dashboard data (no dashboard user)"}), 500
+        except Exception as e:
+            print(f"  [admin/sync] sync_admin_dashboard_data: {e}")
+            return jsonify({"message": "Failed to write dashboard data"}), 500
+        duid = db.get_dashboard_user_id(admin_id)
     if duid:
         settings = db.get_alert_settings(duid) or {}
         if isinstance(data.get("alert_settings"), dict):
@@ -492,6 +590,82 @@ def delete_admin():
     return jsonify({"message": "Admin deleted", "access_code": access_code})
 
 
+@app.route("/admin/create-desktop-link-code", methods=["POST"])
+def create_desktop_link_code():
+    """POST { "access_code": "..." } → admin creates a one-time code for a user to link desktop (user view).
+    Returns { "code": "ABC12XYZ", "expires_in": 600 }. Only the admin (with access_code) can create this."""
+    data = request.get_json(silent=True) or {}
+    access_code = (data.get("access_code") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not access_code:
+        return jsonify({"message": "access_code required"}), 400
+    code, admin_id, admin_name = db.create_desktop_link_code(access_code, expires_seconds=300)
+    if not code:
+        return jsonify({"message": "Invalid access code or could not create code"}), 404
+    return jsonify({"code": code, "expires_in": 300, "admin_name": admin_name})
+
+
+@app.route("/desktop/link-to-admin", methods=["POST"])
+def desktop_link_to_admin():
+    """POST { "code": "..." } → desktop enters the code from admin; links to that admin (user view only).
+    Returns { "admin_id": "...", "admin_name": "..." }. Code is consumed (one-time use)."""
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not code:
+        return jsonify({"message": "code required"}), 400
+    info = db.get_admin_by_desktop_link_code(code)
+    if not info:
+        return jsonify({"message": "Invalid or expired code"}), 404
+    return jsonify({"admin_id": info["admin_id"], "admin_name": info["admin_name"]})
+
+
+@app.route("/user/create-desktop-link-code", methods=["POST"])
+def user_create_desktop_link_code():
+    """POST { "bot_id": "...", "api_key": "..." } → user (app) creates a one-time code for desktop to link to this user.
+    Returns { "code": "...", "expires_in": 300, "user_name": "..." }. Code valid 5 min; one-time use."""
+    data = request.get_json(silent=True) or {}
+    bot_id = (data.get("bot_id") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not bot_id or not api_key:
+        return jsonify({"message": "bot_id and api_key required"}), 400
+    code, user_id, user_name = db.create_user_desktop_link_code(bot_id, api_key, expires_seconds=300)
+    if not code:
+        return jsonify({"message": "User not found or could not create code"}), 404
+    return jsonify({"code": code, "expires_in": 300, "user_name": user_name})
+
+
+@app.route("/user/desktop-by-code", methods=["POST"])
+def user_desktop_by_code():
+    """POST { "code": "..." } → desktop enters the code from the user app; links to that user.
+    Returns { "user_id": "...", "user_name": "..." }. Code is consumed (one-time use)."""
+    data = request.get_json(silent=True) or {}
+    code = (data.get("code") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not code:
+        return jsonify({"message": "code required"}), 400
+    info = db.get_user_by_desktop_link_code(code)
+    if not info:
+        return jsonify({"message": "Invalid or expired code"}), 404
+    return jsonify({
+        "user_id": info["user_id"],
+        "user_name": info["user_name"],
+        "bot_id": info.get("bot_id", ""),
+        "api_key": info.get("api_key", ""),
+        "admin_id": info.get("admin_id", ""),
+        "admin_name": info.get("admin_name", "Admin"),
+    })
+
+
 @app.route("/admin/medical_reminders", methods=["PUT"])
 def put_admin_medical_reminders():
     """PUT { "access_code": "...", "medical_reminders": { "appointments": [], "prescriptions": [], "lab_tests": [], "custom": [] } }.
@@ -511,9 +685,10 @@ def put_admin_medical_reminders():
     role, admin_id = result
     if role != "admin":
         return jsonify({"message": "Access code is not for admin"}), 403
-    duid = db.get_dashboard_user_id(admin_id)
-    if not duid:
-        return jsonify({"message": "Dashboard user not found"}), 500
+    act_as = (data.get("act_as_user_id") or "").strip() or None
+    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    if err:
+        return err
     # Normalize structure
     if medical_reminders is None:
         medical_reminders = {"appointments": [], "prescriptions": [], "lab_tests": [], "custom": []}
@@ -545,6 +720,18 @@ def _resolve_admin_from_access_code(db, access_code):
     if role != "admin":
         return None, (jsonify({"message": "Access code is not for admin"}), 403)
     return admin_id, None
+
+
+def _target_user_for_admin(db, admin_id, act_as_user_id):
+    """Return user_id to use for admin operations: act_as_user_id if valid, else dashboard user. Returns (user_id, None) or (None, error_response)."""
+    if act_as_user_id and (act_as_user_id or "").strip():
+        uid = (act_as_user_id or "").strip()
+        if db.user_belongs_to_admin(uid, admin_id):
+            return uid, None
+    duid = db.get_dashboard_user_id(admin_id)
+    if not duid:
+        return None, (jsonify({"message": "Dashboard user not found"}), 500)
+    return duid, None
 
 
 def _safe_int(value, default):
@@ -635,9 +822,10 @@ def put_admin_medicines():
     if not isinstance(medicines, list):
         return jsonify({"message": "medicines must be a list"}), 400
 
-    duid = db.get_dashboard_user_id(admin_id)
-    if not duid:
-        return jsonify({"message": "Dashboard user not found"}), 500
+    act_as = (data.get("act_as_user_id") or "").strip() or None
+    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    if err:
+        return err
 
     desired = {}
     meta_payload = _extract_medicine_meta_from_medicines(medicines)
@@ -748,9 +936,10 @@ def put_admin_alert_settings():
     if err:
         return err
 
-    duid = db.get_dashboard_user_id(admin_id)
-    if not duid:
-        return jsonify({"message": "Dashboard user not found"}), 500
+    act_as = (data.get("act_as_user_id") or "").strip() or None
+    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    if err:
+        return err
 
     current = db.get_alert_settings(duid) or {}
     if not isinstance(current, dict):
