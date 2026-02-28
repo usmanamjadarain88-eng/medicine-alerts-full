@@ -149,7 +149,7 @@ def health():
 # ---- Auth / credentials ----
 @app.route("/save-credentials", methods=["POST"])
 def save_credentials():
-    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } Ã¢â€ â€™ admins or users.
+    """POST { bot_id, api_key, role?, access_code? (for admin), fcm_token? } → admins or users.
     If role=admin and access_code is sent, update that admin's bot_id/api_key (so app links to desktop-created admin).
     """
     data = request.get_json() or {}
@@ -189,14 +189,15 @@ def save_credentials():
 
 @app.route("/connect-to-admin", methods=["POST"])
 def connect_to_admin():
-    """POST { connection_code, bot_id, api_key, name? } Ã¢â€ â€™ link this app (user) to the admin with that connection_code.
-    Backend creates/updates user row with this admin_id and bot_id+api_key. Returns admin_id on success.
+    """POST { connection_code, bot_id, api_key, name?, email? } → link this app (user) to the admin with that connection_code.
+    If email is sent, any previous user row for the same admin+email (e.g. old install) is removed so the same person has only one entry.
     """
     data = request.get_json() or {}
     connection_code = (data.get("connection_code") or "").strip()
     bot_id = (data.get("bot_id") or "").strip()
     api_key = (data.get("api_key") or "").strip()
     name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
     db = get_db()
     if not db:
         return jsonify({"message": "Central DB not configured"}), 503
@@ -207,10 +208,59 @@ def connect_to_admin():
         return jsonify({"message": "Invalid connection code"}), 404
     admin_id = admin.get("id")
     admin_name = admin.get("name") or ""
-    user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name)
+    user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name, email=email or None)
     if not user_id:
         return jsonify({"message": "Failed to link user"}), 500
     return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id, "admin_name": admin_name})
+
+
+def _send_alert_via_relay(bot_id, api_key, alert_type, message):
+    """Send alert to relay so it reaches admin's app (FCM or WebSocket)."""
+    import json
+    import asyncio
+    bot_id = (bot_id or "").strip()
+    api_key = (api_key or "").strip()
+    if not bot_id or not api_key:
+        return False
+    relay_url = os.environ.get("RELAY_URL", "wss://curax-relay.onrender.com").strip()
+    try:
+        import websockets
+        async def _ws_send():
+            async with websockets.connect(relay_url, close_timeout=2, open_timeout=15) as ws:
+                await ws.send(json.dumps({
+                    "action": "alert",
+                    "bot_id": bot_id,
+                    "api_key": api_key,
+                    "type": alert_type or "alert",
+                    "message": message or "",
+                }))
+        asyncio.run(_ws_send())
+        return True
+    except Exception as e:
+        print(f"[notify-event] relay send failed ({bot_id[:8]}...): {e}")
+        return False
+
+
+@app.route("/notify-event", methods=["POST"])
+def notify_event():
+    """POST { access_code, event_type, message } → desktop tells backend of admin-only events.
+    Backend finds admin bot_id+api_key by access_code, sends alert to relay → admin's app (FCM preferred).
+    Events: system_started, system_unlocked, admin_login, dose_taken, etc.
+    """
+    data = request.get_json() or {}
+    access_code = (data.get("access_code") or "").strip()
+    event_type = (data.get("event_type") or "alert").strip()
+    message = (data.get("message") or "").strip()
+    if not access_code:
+        return jsonify({"message": "access_code required"}), 400
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    bot = db.get_admin_bot_by_access_code(access_code)
+    if not bot:
+        return jsonify({"message": "Admin not found or credentials not yet registered (admin must sign up on app first)"}), 404
+    ok = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message)
+    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
 
 
 @app.route("/admin/linked-users", methods=["GET"])
@@ -277,7 +327,7 @@ def get_role():
 
 @app.route("/admin/data", methods=["GET"])
 def admin_data():
-    """GET /admin/data?access_code=...&last_sync_time=... (optional) Ã¢â€ â€™ dashboard data.
+    """GET /admin/data?access_code=...&last_sync_time=... (optional) → dashboard data.
     If last_sync_time (ISO) is sent, only data updated after that time is returned (incremental). Always returns server_time.
     """
     access_code = (request.args.get("access_code") or "").strip()
@@ -309,13 +359,11 @@ def admin_data():
     }
     settings_obj = out["alert_settings"] if isinstance(out["alert_settings"], dict) else {}
     medicine_meta = settings_obj.get("medicine_meta") if isinstance(settings_obj.get("medicine_meta"), dict) else {}
-
     for m in out["medicines"]:
         if "times" not in m or m["times"] is None:
             m["times"] = []
         elif not isinstance(m["times"], list):
             m["times"] = list(m["times"]) if hasattr(m["times"], "__iter__") and not isinstance(m["times"], str) else []
-
         if "quantity" not in m or m["quantity"] is None:
             m["quantity"] = 0
         else:
@@ -391,7 +439,6 @@ def admin_sync():
             settings["gmail_config"] = data["gmail_config"]
         if isinstance(data.get("medical_reminders"), dict):
             settings["medical_reminders"] = data["medical_reminders"]
-        # Also persist SMS / mobile notification config centrally, so Android can read it too.
         if isinstance(data.get("sms_config"), dict):
             settings["sms_config"] = data["sms_config"]
         if isinstance(data.get("mobile_bot_config"), dict):
@@ -399,7 +446,6 @@ def admin_sync():
         if isinstance(data.get("admin_bot_config"), dict):
             settings["admin_bot_config"] = data["admin_bot_config"]
 
-        # Persist rich medicine metadata from desktop payload so Android and desktop stay field-aligned.
         incoming_meta = _extract_medicine_meta_from_boxes(medicine_boxes)
         existing_meta = settings.get("medicine_meta") if isinstance(settings.get("medicine_meta"), dict) else {}
         merged_meta = {}
@@ -407,9 +453,7 @@ def admin_sync():
             if box in (medicine_boxes or {}):
                 if isinstance((medicine_boxes or {}).get(box), dict) and box in incoming_meta:
                     merged_meta[box] = incoming_meta[box]
-                # Box explicitly provided but empty -> remove metadata for that box.
             elif box in existing_meta:
-                # Box omitted from payload -> keep previous metadata.
                 merged_meta[box] = existing_meta[box]
         settings["medicine_meta"] = merged_meta
 
@@ -421,7 +465,7 @@ def admin_sync():
 
 @app.route("/admin/notify", methods=["POST"])
 def admin_notify():
-    """POST { "access_code": "..." } Ã¢â€ â€™ tell data bus to push latest admin data to connected clients (WebSocket)."""
+    """POST { "access_code": "..." } → tell data bus to push latest admin data to connected clients (WebSocket)."""
     data = request.get_json(silent=True) or {}
     access_code = (data.get("access_code") or "").strip()
     if not access_code:
@@ -432,7 +476,7 @@ def admin_notify():
 
 @app.route("/admin", methods=["DELETE"])
 def delete_admin():
-    """DELETE /admin with JSON { "access_code": "..." } Ã¢â€ â€™ delete that admin from Central DB.
+    """DELETE /admin with JSON { "access_code": "..." } → delete that admin from Central DB.
     Frees access_code and connection_code so they can be allotted to new admins. Called by desktop when user deletes admin.
     """
     data = request.get_json(silent=True) or {}
@@ -487,8 +531,6 @@ def put_admin_medical_reminders():
         return jsonify({"message": "Failed to save"}), 500
     notify_databus(access_code)
     return jsonify({"message": "ok", "medical_reminders": medical_reminders})
-
-
 
 
 def _resolve_admin_from_access_code(db, access_code):
@@ -638,7 +680,7 @@ def put_admin_medicines():
         }
 
     existing = db.list_medicines(duid)
-    by_box = { (e.get("box_id") or "").strip().upper(): e for e in existing if isinstance(e, dict) }
+    by_box = {(e.get("box_id") or "").strip().upper(): e for e in existing if isinstance(e, dict)}
 
     for box_id in ["B1", "B2", "B3", "B4", "B5", "B6"]:
         incoming = desired.get(box_id)
@@ -669,16 +711,14 @@ def put_admin_medicines():
                 )
                 if not mid:
                     return jsonify({"message": f"Failed to create {box_id}"}), 500
-        else:
-            if current:
-                ok = db.delete_medicine(current.get("id"))
-                if not ok:
-                    return jsonify({"message": f"Failed to delete {box_id}"}), 500
+        elif current:
+            ok = db.delete_medicine(current.get("id"))
+            if not ok:
+                return jsonify({"message": f"Failed to delete {box_id}"}), 500
 
     settings = db.get_alert_settings(duid) or {}
     if not isinstance(settings, dict):
         settings = {}
-    existing_meta = settings.get("medicine_meta") if isinstance(settings.get("medicine_meta"), dict) else {}
     merged_meta = {}
     for box in ["B1", "B2", "B3", "B4", "B5", "B6"]:
         if box in desired:
@@ -720,7 +760,6 @@ def put_admin_alert_settings():
     incoming_gmail = data.get("gmail_config")
     incoming_reminders = data.get("medical_reminders")
 
-    # Backward compatibility: if client sends direct alert_settings object fields at top-level.
     if not isinstance(incoming_alert, dict):
         direct_keys = {"medicine_alerts", "missed_dose_escalation", "stock_alerts", "expiry_alerts"}
         top = {k: data.get(k) for k in direct_keys if isinstance(data.get(k), dict)}
@@ -740,6 +779,8 @@ def put_admin_alert_settings():
 
     notify_databus(access_code)
     return jsonify({"message": "ok", "settings": current})
+
+
 # ---- Medicines ----
 @app.route("/medicines", methods=["GET"])
 def list_medicines():
@@ -912,7 +953,10 @@ def _start_alert_scheduler():
         try:
             from .alert_scheduler import BackendAlertScheduler
         except ImportError:
-            from alert_scheduler import BackendAlertScheduler
+            try:
+                from backend.alert_scheduler import BackendAlertScheduler
+            except ImportError:
+                from alert_scheduler import BackendAlertScheduler
         _alert_scheduler_instance = BackendAlertScheduler(get_db)
         _alert_scheduler_instance.start()
     except Exception as e:
@@ -941,4 +985,3 @@ if __name__ == "__main__":
         print("Database connection: FAILED - /admin/sync and /admin/data will return 503")
     print("")
     app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG", "0") == "1")
-
