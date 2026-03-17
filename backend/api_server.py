@@ -295,10 +295,11 @@ def notify_event():
     bot = db.get_admin_bot_by_access_code(access_code)
     if not bot:
         return jsonify({"message": "Admin not found or credentials not yet registered (admin must sign up on app first)"}), 404
-    ok, err = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message, fcm_token=bot.get("fcm_token"))
-    if ok:
-        return jsonify({"message": "ok"}), 200
-    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
+    bid, akey, fcm = bot.get("bot_id"), bot.get("api_key"), bot.get("fcm_token")
+    def _deliver():
+        _send_alert_via_relay(bid, akey, event_type, message, fcm_token=fcm)
+    threading.Thread(target=_deliver, daemon=True, name="NotifyRelay").start()
+    return jsonify({"message": "ok"}), 200
 
 
 @app.route("/notify-event-by-user", methods=["POST"])
@@ -328,15 +329,15 @@ def notify_event_by_user():
     admin_api_key = info.get("admin_api_key") or ""
     if not admin_bot_id or not admin_api_key:
         return jsonify({"message": "Admin app not registered yet"}), 404
-    admin_fcm = db.get_fcm_token_for_bot(admin_bot_id, admin_api_key)
-    ok, err = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message, fcm_token=admin_fcm)
     try:
         db.create_alert(info["user_id"], info["admin_id"], event_type, message)
     except Exception:
         pass
-    if ok:
-        return jsonify({"message": "ok"}), 200
-    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
+    admin_fcm = db.get_fcm_token_for_bot(admin_bot_id, admin_api_key)
+    def _deliver():
+        _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message, fcm_token=admin_fcm)
+    threading.Thread(target=_deliver, daemon=True, name="NotifyRelay").start()
+    return jsonify({"message": "ok"}), 200
 
 
 @app.route("/notify-event-to-user", methods=["POST"])
@@ -363,10 +364,10 @@ def notify_event_to_user():
             }), 410
         return jsonify({"message": "User not found or not linked to an admin"}), 404
     user_fcm = db.get_fcm_token_for_bot(bot_id, api_key)
-    ok, err = _send_alert_via_relay(bot_id, api_key, event_type, message, fcm_token=user_fcm)
-    if ok:
-        return jsonify({"message": "ok"}), 200
-    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
+    def _deliver():
+        _send_alert_via_relay(bot_id, api_key, event_type, message, fcm_token=user_fcm)
+    threading.Thread(target=_deliver, daemon=True, name="NotifyRelay").start()
+    return jsonify({"message": "ok"}), 200
 
 
 @app.route("/admin/linked-users", methods=["GET"])
