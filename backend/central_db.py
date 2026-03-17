@@ -390,30 +390,59 @@ class CentralDB:
             cur.close()
 
     def get_admin_bot_by_access_code(self, access_code):
-        """Return { bot_id, api_key } for admin with this access_code, or None.
-        Used when desktop notifies backend of events (system_started, admin_login, dose_taken, etc.)
-        so backend can forward alerts to admin's app via relay."""
+        """Return { bot_id, api_key, fcm_token } for admin with this access_code, or None.
+        Used when desktop notifies backend of events; fcm_token is passed to relay for FCM-first push."""
         code = (access_code or "").strip().upper()
         if not code:
             return None
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            cur.execute("SELECT bot_id, api_key FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
+            cur.execute("SELECT bot_id, api_key, fcm_token FROM admins WHERE admin_access_code = %s LIMIT 1", (code,))
             row = cur.fetchone()
             if row and hasattr(row, "keys"):
                 bid = (row.get("bot_id") or "").strip()
                 akey = (row.get("api_key") or "").strip()
+                fcm = (row.get("fcm_token") or "").strip() or None
                 if bid and akey:
-                    return {"bot_id": bid, "api_key": akey}
+                    return {"bot_id": bid, "api_key": akey, "fcm_token": fcm}
             if row:
                 bid = (row[0] or "").strip()
                 akey = (row[1] or "").strip()
+                fcm = (row[2] or "").strip() or None if len(row) > 2 else None
                 if bid and akey:
-                    return {"bot_id": bid, "api_key": akey}
+                    return {"bot_id": bid, "api_key": akey, "fcm_token": fcm}
             return None
         except Exception as e:
             print(f"CentralDB get_admin_bot_by_access_code: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def get_fcm_token_for_bot(self, bot_id, api_key):
+        """Return fcm_token for this bot_id+api_key (admin or user). Used so relay can try FCM first."""
+        bot_id = (bot_id or "").strip()
+        api_key = (api_key or "").strip()
+        if not bot_id or not api_key:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT fcm_token FROM admins WHERE bot_id = %s AND api_key = %s LIMIT 1", (bot_id, api_key))
+            row = cur.fetchone()
+            if row and row[0]:
+                t = (row[0] or "").strip()
+                if t:
+                    return t
+            cur.execute("SELECT fcm_token FROM users WHERE bot_id = %s AND api_key = %s LIMIT 1", (bot_id, api_key))
+            row = cur.fetchone()
+            if row and row[0]:
+                t = (row[0] or "").strip()
+                if t:
+                    return t
+            return None
+        except Exception as e:
+            print(f"CentralDB get_fcm_token_for_bot: {e}")
             return None
         finally:
             cur.close()
