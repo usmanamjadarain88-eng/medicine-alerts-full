@@ -163,18 +163,21 @@ class BackendAlertScheduler:
         api_key = (api_key or "").strip()
         if not bot_id or not api_key:
             return False
+        payload = {"action": "alert", "bot_id": bot_id, "api_key": api_key, "type": alert_type, "message": message or ""}
+        db = self._get_db()
+        if db and hasattr(db, "get_fcm_token_for_bot"):
+            try:
+                fcm = db.get_fcm_token_for_bot(bot_id, api_key)
+                if fcm:
+                    payload["fcm_token"] = fcm
+            except Exception:
+                pass
         try:
             import websockets
 
             async def _ws_send():
                 async with websockets.connect(RELAY_URL, close_timeout=2, open_timeout=15) as ws:
-                    await ws.send(json.dumps({
-                        "action": "alert",
-                        "bot_id": bot_id,
-                        "api_key": api_key,
-                        "type": alert_type,
-                        "message": message,
-                    }))
+                    await ws.send(json.dumps(payload))
 
             asyncio.run(_ws_send())
             return True
