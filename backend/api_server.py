@@ -221,12 +221,24 @@ def connect_to_admin():
     return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id, "admin_name": admin_name})
 
 
+def _wake_relay_if_needed(relay_url):
+    """Hit relay HTTP /status to wake it (e.g. Render cold start). Ignore errors; WebSocket will retry."""
+    try:
+        import urllib.request as _urllib
+        http_url = relay_url.replace("wss://", "https://", 1).replace("ws://", "http://", 1).rstrip("/")
+        req = _urllib.Request(http_url + "/status", method="GET")
+        _urllib.urlopen(req, timeout=45)
+    except Exception:
+        pass
+
+
 def _send_alert_via_relay(bot_id, api_key, alert_type, message, fcm_token=None):
-    """Send alert to relay so it reaches admin's app. FCM first when fcm_token is provided.
-    Returns (True, None) on success, (False, error_message) on failure. One retry after 2s for cold start."""
+    """Send alert to relay so it reaches the user at any cost. FCM token from DB so push works even when phone is off.
+    Wakes relay if cold (Render), then retries WebSocket with long timeouts until relay is up; relay sends via FCM."""
     import json
     import asyncio
     import time
+    import urllib.request
     bot_id = (bot_id or "").strip()
     api_key = (api_key or "").strip()
     if not bot_id or not api_key:
@@ -243,19 +255,24 @@ def _send_alert_via_relay(bot_id, api_key, alert_type, message, fcm_token=None):
     if fcm:
         payload["fcm_token"] = fcm
     last_error = None
-    for attempt in range(2):
+    # Wake relay first (GET /status) so cold start begins; then retry WebSocket until relay is up
+    _wake_relay_if_needed(relay_url)
+    time.sleep(3)
+    # 5 attempts with backoff: 3s, +5s, +15s, +30s, +45s between attempts; 60s open_timeout each
+    delays = (0, 5, 15, 30, 45)
+    for attempt in range(5):
+        if attempt > 0:
+            time.sleep(delays[attempt])
         try:
             import websockets
             async def _ws_send():
-                async with websockets.connect(relay_url, close_timeout=5, open_timeout=25) as ws:
+                async with websockets.connect(relay_url, close_timeout=15, open_timeout=60) as ws:
                     await ws.send(json.dumps(payload))
             asyncio.run(_ws_send())
             return True, None
         except Exception as e:
             last_error = str(e).strip() or repr(e)
-            print(f"[notify-event] relay send failed attempt {attempt + 1} ({bot_id[:8]}...): {e}")
-            if attempt == 0:
-                time.sleep(2)
+            print(f"[notify-event] relay attempt {attempt + 1}/5 ({bot_id[:8]}...): {e}")
     err_msg = (last_error or "Unknown error")[:200]
     return False, err_msg
 
