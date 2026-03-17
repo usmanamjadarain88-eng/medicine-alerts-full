@@ -295,9 +295,14 @@ def notify_event():
     bot = db.get_admin_bot_by_access_code(access_code)
     if not bot:
         return jsonify({"message": "Admin not found or credentials not yet registered (admin must sign up on app first)"}), 404
-    bid, akey, fcm = bot.get("bot_id"), bot.get("api_key"), bot.get("fcm_token")
+    bid, akey = bot.get("bot_id"), bot.get("api_key")
+    fcm = (bot.get("fcm_token") or "").strip() or None
+    if not fcm:
+        fcm = db.get_fcm_token_for_bot(bid, akey) or None
     def _deliver():
-        _send_alert_via_relay(bid, akey, event_type, message, fcm_token=fcm)
+        db2 = get_db()
+        fcm_now = (fcm or (db2.get_fcm_token_for_bot(bid, akey) if db2 else None) or "").strip() or None
+        _send_alert_via_relay(bid, akey, event_type, message, fcm_token=fcm_now)
     threading.Thread(target=_deliver, daemon=True, name="NotifyRelay").start()
     return jsonify({"message": "ok"}), 200
 
