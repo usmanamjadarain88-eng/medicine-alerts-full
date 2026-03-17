@@ -222,30 +222,38 @@ def connect_to_admin():
 
 
 def _send_alert_via_relay(bot_id, api_key, alert_type, message):
-    """Send alert to relay so it reaches admin's app (FCM or WebSocket)."""
+    """Send alert to relay so it reaches admin's app (FCM or WebSocket).
+    Returns (True, None) on success, (False, error_message) on failure. One retry after 2s for cold start."""
     import json
     import asyncio
+    import time
     bot_id = (bot_id or "").strip()
     api_key = (api_key or "").strip()
     if not bot_id or not api_key:
-        return False
+        return False, "Missing bot_id or api_key"
     relay_url = os.environ.get("RELAY_URL", "wss://curax-relay.onrender.com").strip()
-    try:
-        import websockets
-        async def _ws_send():
-            async with websockets.connect(relay_url, close_timeout=2, open_timeout=15) as ws:
-                await ws.send(json.dumps({
-                    "action": "alert",
-                    "bot_id": bot_id,
-                    "api_key": api_key,
-                    "type": alert_type or "alert",
-                    "message": message or "",
-                }))
-        asyncio.run(_ws_send())
-        return True
-    except Exception as e:
-        print(f"[notify-event] relay send failed ({bot_id[:8]}...): {e}")
-        return False
+    last_error = None
+    for attempt in range(2):
+        try:
+            import websockets
+            async def _ws_send():
+                async with websockets.connect(relay_url, close_timeout=5, open_timeout=25) as ws:
+                    await ws.send(json.dumps({
+                        "action": "alert",
+                        "bot_id": bot_id,
+                        "api_key": api_key,
+                        "type": alert_type or "alert",
+                        "message": message or "",
+                    }))
+            asyncio.run(_ws_send())
+            return True, None
+        except Exception as e:
+            last_error = str(e).strip() or repr(e)
+            print(f"[notify-event] relay send failed attempt {attempt + 1} ({bot_id[:8]}...): {e}")
+            if attempt == 0:
+                time.sleep(2)
+    err_msg = (last_error or "Unknown error")[:200]
+    return False, err_msg
 
 
 @app.route("/notify-event", methods=["POST"])
@@ -266,8 +274,10 @@ def notify_event():
     bot = db.get_admin_bot_by_access_code(access_code)
     if not bot:
         return jsonify({"message": "Admin not found or credentials not yet registered (admin must sign up on app first)"}), 404
-    ok = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message)
-    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
+    ok, err = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message)
+    if ok:
+        return jsonify({"message": "ok"}), 200
+    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
 
 
 @app.route("/notify-event-by-user", methods=["POST"])
@@ -297,12 +307,14 @@ def notify_event_by_user():
     admin_api_key = info.get("admin_api_key") or ""
     if not admin_bot_id or not admin_api_key:
         return jsonify({"message": "Admin app not registered yet"}), 404
-    ok = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message)
+    ok, err = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message)
     try:
         db.create_alert(info["user_id"], info["admin_id"], event_type, message)
     except Exception:
         pass
-    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
+    if ok:
+        return jsonify({"message": "ok"}), 200
+    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
 
 
 @app.route("/notify-event-to-user", methods=["POST"])
@@ -328,8 +340,10 @@ def notify_event_to_user():
                 "message": deleted_info.get("message", "The admin has removed you from their account."),
             }), 410
         return jsonify({"message": "User not found or not linked to an admin"}), 404
-    ok = _send_alert_via_relay(bot_id, api_key, event_type, message)
-    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
+    ok, err = _send_alert_via_relay(bot_id, api_key, event_type, message)
+    if ok:
+        return jsonify({"message": "ok"}), 200
+    return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
 
 
 @app.route("/admin/linked-users", methods=["GET"])
