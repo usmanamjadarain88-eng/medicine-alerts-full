@@ -3,6 +3,7 @@ Backend (one server). All data lives in the database; clients use HTTPS and data
 Run: python -m backend.api_server or from backend/ python api_server.py
 """
 import os
+import threading
 from flask import Flask, request, jsonify
 
 _backend_dir = os.path.abspath(os.path.dirname(__file__))
@@ -304,6 +305,33 @@ def notify_event_by_user():
     return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
 
 
+@app.route("/notify-event-to-user", methods=["POST"])
+def notify_event_to_user():
+    """POST { bot_id, api_key, event_type, message } → send alert to that user's app (e.g. desktop 'Test alert' in user view).
+    Backend verifies the user exists, then sends to relay so the user's app receives the alert."""
+    data = request.get_json() or {}
+    bot_id = (data.get("bot_id") or "").strip()
+    api_key = (data.get("api_key") or "").strip()
+    event_type = (data.get("event_type") or "alert").strip()
+    message = (data.get("message") or "").strip()
+    if not bot_id or not api_key:
+        return jsonify({"message": "bot_id and api_key required"}), 400
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    user_id = db.get_user_id_by_bot(bot_id, api_key)
+    if not user_id:
+        deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+        if deleted_info:
+            return jsonify({
+                "reason": "deleted_by_admin",
+                "message": deleted_info.get("message", "The admin has removed you from their account."),
+            }), 410
+        return jsonify({"message": "User not found or not linked to an admin"}), 404
+    ok = _send_alert_via_relay(bot_id, api_key, event_type, message)
+    return jsonify({"message": "ok" if ok else "relay send failed"}), 200 if ok else 500
+
+
 @app.route("/admin/linked-users", methods=["GET"])
 def get_linked_users():
     """GET /admin/linked-users?access_code=... -> list of users linked to this admin (excluding dashboard user)."""
@@ -319,6 +347,47 @@ def get_linked_users():
     admin_id = admin.get("id")
     users = db.get_all_users_by_admin_id(admin_id) or []
     return jsonify({"users": users})
+
+
+@app.route("/admin/fcm-token", methods=["PUT"])
+def put_admin_fcm_token():
+    """PUT { access_code, fcm_token } → update admin's FCM token. Called when app gets FCM token (e.g. after permission).
+    So push alerts (and Test alert) work; relay uses FCM first when available."""
+    data = request.get_json(silent=True) or {}
+    access_code = (data.get("access_code") or "").strip()
+    fcm_token = (data.get("fcm_token") or "").strip()
+    if not access_code:
+        return jsonify({"message": "access_code required"}), 400
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    ok = db.update_admin_fcm_token_by_access_code(access_code, fcm_token if fcm_token else None)
+    if not ok:
+        return jsonify({"message": "Admin not found for this access code"}), 404
+    return jsonify({"message": "ok"})
+
+
+@app.route("/admin/connection", methods=["GET"])
+def get_admin_connection():
+    """GET /admin/connection?access_code=... → { fcm_token_set, connected, linked_users } for Connection panel.
+    connected = admin has bot_id+api_key (app has registered); fcm_token_set = FCM token stored for push."""
+    access_code = (request.args.get("access_code") or "").strip()
+    if not access_code:
+        return jsonify({"message": "access_code required", "fcm_token_set": False, "connected": False, "linked_users": []}), 400
+    db = get_db()
+    if not db:
+        return jsonify({"fcm_token_set": False, "connected": False, "linked_users": []}), 503
+    status = db.get_admin_connection_status(access_code)
+    if not status:
+        return jsonify({"fcm_token_set": False, "connected": False, "linked_users": []}), 404
+    admin = db.get_admin_by_access_code(access_code)
+    admin_id = admin.get("id") if admin else None
+    users = db.get_all_users_by_admin_id(admin_id) or [] if admin_id else []
+    return jsonify({
+        "fcm_token_set": status.get("fcm_token_set", False),
+        "connected": status.get("connected", False),
+        "linked_users": [{"id": str(u.get("id", "")), "name": u.get("name"), "bot_id": u.get("bot_id")} for u in users],
+    })
 
 
 @app.route("/admin/users/<user_id>", methods=["DELETE"])
@@ -558,6 +627,7 @@ def admin_sync():
         if not db.upsert_alert_settings(duid, settings):
             return jsonify({"message": "Failed to save alert settings"}), 500
     notify_databus(access_code)
+    _trigger_alert_checks_for_admin(admin_id)
     return jsonify({"message": "ok"})
 
 
@@ -705,6 +775,7 @@ def put_admin_medical_reminders():
     if not ok:
         return jsonify({"message": "Failed to save"}), 500
     notify_databus(access_code)
+    _trigger_alert_checks_for_admin(admin_id)
     return jsonify({"message": "ok", "medical_reminders": medical_reminders})
 
 
@@ -916,6 +987,7 @@ def put_admin_medicines():
         return jsonify({"message": "Failed to save medicine metadata"}), 500
 
     notify_databus(access_code)
+    _trigger_alert_checks_for_admin(admin_id)
     return jsonify({"message": "ok", "saved_boxes": len(desired)})
 
 
@@ -967,6 +1039,7 @@ def put_admin_alert_settings():
         return jsonify({"message": "Failed to save settings"}), 500
 
     notify_databus(access_code)
+    _trigger_alert_checks_for_admin(admin_id)
     return jsonify({"message": "ok", "settings": current})
 
 
@@ -993,6 +1066,7 @@ def create_medicine():
     mid = db.create_medicine(user_id, name, box_id=data.get("box_id"), dosage=data.get("dosage"), times=data.get("times"), low_stock=data.get("low_stock", 5))
     if not mid:
         return jsonify({"message": "create failed"}), 500
+    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id))
     return jsonify({"id": mid, "user_id": user_id, "name": name, "box_id": data.get("box_id"), "dosage": data.get("dosage"), "times": data.get("times") or [], "low_stock": data.get("low_stock", 5)})
 
 
@@ -1002,9 +1076,11 @@ def update_medicine(medicine_id):
     db = get_db()
     if not db:
         return jsonify({"message": "Central DB not configured"}), 503
+    user_id = db.get_user_id_by_medicine_id(medicine_id)
     ok = db.update_medicine(medicine_id, name=data.get("name"), box_id=data.get("box_id"), dosage=data.get("dosage"), times=data.get("times"), low_stock=data.get("low_stock"))
     if not ok:
         return jsonify({"message": "update failed"}), 404
+    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id) if user_id else None)
     return jsonify({"message": "ok"})
 
 
@@ -1013,9 +1089,11 @@ def delete_medicine(medicine_id):
     db = get_db()
     if not db:
         return jsonify({"message": "Central DB not configured"}), 503
+    user_id = db.get_user_id_by_medicine_id(medicine_id)
     ok = db.delete_medicine(medicine_id)
     if not ok:
         return jsonify({"message": "not found"}), 404
+    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id) if user_id else None)
     return "", 204
 
 
@@ -1032,6 +1110,7 @@ def create_dose_log():
     lid = db.create_dose_log(user_id, medicine_id=data.get("medicine_id"), box_id=data.get("box_id"), taken_at=data.get("taken_at"), source=data.get("source", "desktop"))
     if not lid:
         return jsonify({"message": "create failed"}), 500
+    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id))
     return jsonify({"id": lid})
 
 
@@ -1096,6 +1175,8 @@ def put_alert_settings():
     if not user_id:
         return jsonify({"message": "user_id required"}), 400
     ok = db.upsert_alert_settings(user_id, settings or {})
+    if ok:
+        _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id))
     return jsonify(settings or {}) if ok else (jsonify({"message": "failed"}), 500)
 
 
@@ -1154,6 +1235,21 @@ def _start_alert_scheduler():
 
 # Start scheduler when imported by gunicorn (module-level, runs once per worker)
 _start_alert_scheduler()
+
+
+def _trigger_alert_checks_for_admin(admin_id):
+    """Event-based: run alert checks for this admin in a background thread after data changed. No-op if scheduler disabled."""
+    if not admin_id:
+        return
+    if _alert_scheduler_instance is None:
+        return
+    t = threading.Thread(
+        target=_alert_scheduler_instance.run_checks_for_admin,
+        args=(str(admin_id),),
+        daemon=True,
+        name="AlertCheck",
+    )
+    t.start()
 
 
 if __name__ == "__main__":
