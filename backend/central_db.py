@@ -418,6 +418,58 @@ class CentralDB:
         finally:
             cur.close()
 
+    def update_admin_fcm_token_by_access_code(self, access_code, fcm_token):
+        """Update only fcm_token for the admin with this access_code. Used when app gets FCM token after permission grant.
+        Returns True if admin was found and updated."""
+        code = (access_code or "").strip().upper()
+        if not code:
+            return False
+        fcm = (fcm_token or "").strip() or None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE admins SET fcm_token = %s, updated_at = NOW() WHERE admin_access_code = %s",
+                (fcm or "", code),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            print(f"CentralDB update_admin_fcm_token_by_access_code: {e}")
+            return False
+        finally:
+            cur.close()
+
+    def get_admin_connection_status(self, access_code):
+        """Return { connected: bool, fcm_token_set: bool } for admin with this access_code, or None if not found.
+        connected = has bot_id and api_key; fcm_token_set = has non-empty fcm_token."""
+        code = (access_code or "").strip().upper()
+        if not code:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT bot_id, api_key, fcm_token FROM admins WHERE admin_access_code = %s LIMIT 1",
+                (code,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            bid = (row[0] or "").strip()
+            akey = (row[1] or "").strip()
+            fcm = (row[2] or "").strip() if len(row) > 2 else ""
+            return {
+                "connected": bool(bid and akey),
+                "fcm_token_set": bool(fcm),
+            }
+        except Exception as e:
+            print(f"CentralDB get_admin_connection_status: {e}")
+            return None
+        finally:
+            cur.close()
+
     def get_admin_by_access_code(self, access_code):
         """Return admin row { id, name, admin_access_code, connection_code } for this access code, or None.
         Used by Android app: enter code → identify as admin.
@@ -538,6 +590,29 @@ class CentralDB:
             return None
         except Exception as e:
             print(f"CentralDB get_admin_id_by_bot: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def get_admin_id_by_user_id(self, user_id):
+        """Return admin_id for the given user_id, or None. Used for event-based alert triggers."""
+        if not user_id:
+            return None
+        try:
+            uuid.UUID(str(user_id))
+        except (ValueError, TypeError):
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT admin_id FROM users WHERE id = %s::uuid LIMIT 1", (user_id,))
+            row = cur.fetchone()
+            if row:
+                aid = row[0]
+                return str(aid) if isinstance(aid, uuid.UUID) else aid
+            return None
+        except Exception as e:
+            print(f"CentralDB get_admin_id_by_user_id: {e}")
             return None
         finally:
             cur.close()
@@ -1109,6 +1184,29 @@ class CentralDB:
         finally:
             cur.close()
 
+    def get_user_id_by_medicine_id(self, medicine_id):
+        """Return user_id for the given medicine_id, or None. Used for event-based alert triggers."""
+        if not medicine_id:
+            return None
+        try:
+            uuid.UUID(str(medicine_id))
+        except (ValueError, TypeError):
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT user_id FROM medicines WHERE id = %s::uuid LIMIT 1", (medicine_id,))
+            row = cur.fetchone()
+            if row:
+                uid = row[0]
+                return str(uid) if isinstance(uid, uuid.UUID) else uid
+            return None
+        except Exception as e:
+            print(f"CentralDB get_user_id_by_medicine_id: {e}")
+            return None
+        finally:
+            cur.close()
+
     def update_medicine(self, medicine_id, name=None, box_id=None, dosage=None, times=None, low_stock=None, quantity=None):
         if not medicine_id:
             return False
@@ -1332,21 +1430,25 @@ class CentralDB:
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            q = "SELECT id, user_id, admin_id, type, message, status, created_at FROM alerts WHERE 1=1"
+            q = """SELECT a.id, a.user_id, a.admin_id, a.type, a.message, a.status, a.created_at,
+                    COALESCE(u.name, '') AS user_name
+                    FROM alerts a
+                    LEFT JOIN users u ON u.id = a.user_id
+                    WHERE 1=1"""
             params = []
             if user_id:
-                q += " AND user_id = %s::uuid"
+                q += " AND a.user_id = %s::uuid"
                 params.append(user_id)
             if admin_id:
-                q += " AND admin_id = %s::uuid"
+                q += " AND a.admin_id = %s::uuid"
                 params.append(admin_id)
             if status:
-                q += " AND status = %s"
+                q += " AND a.status = %s"
                 params.append(status)
             if since:
-                q += " AND created_at > %s::timestamptz"
+                q += " AND a.created_at > %s::timestamptz"
                 params.append(since)
-            q += " ORDER BY created_at DESC LIMIT %s"
+            q += " ORDER BY a.created_at DESC LIMIT %s"
             params.append(limit)
             cur.execute(q, params)
             rows = cur.fetchall()
@@ -1358,12 +1460,15 @@ class CentralDB:
                         "id": str(r["id"]), "user_id": str(r["user_id"]), "admin_id": str(r["admin_id"]),
                         "type": r["type"], "message": r["message"], "status": r["status"],
                         "created_at": r["created_at"].isoformat() if hasattr(r["created_at"], "isoformat") else str(r["created_at"]),
+                        "user_name": (r.get("user_name") or "").strip() or "User",
                     })
                 else:
+                    user_name = (row[7] if len(row) > 7 else "") or "User"
                     out.append({
                         "id": str(row[0]), "user_id": str(row[1]), "admin_id": str(row[2]),
                         "type": row[3], "message": row[4], "status": row[5],
                         "created_at": row[6].isoformat() if hasattr(row[6], "isoformat") else str(row[6]),
+                        "user_name": str(user_name).strip() or "User",
                     })
             return out
         except Exception as e:
@@ -1522,6 +1627,30 @@ class CentralDB:
             all_meds = self.list_medicines(user_id)
             out["medicine_box_ids"] = [m.get("box_id") for m in all_meds if m.get("box_id")]
         return out
+
+    def get_admin_by_id(self, admin_id):
+        """Return one admin {id, name, bot_id, api_key} for the given admin_id, or None. Used for event-based alert checks."""
+        if not admin_id:
+            return None
+        try:
+            uuid.UUID(str(admin_id))
+        except (ValueError, TypeError):
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
+        try:
+            cur.execute("SELECT id, name, bot_id, api_key FROM admins WHERE id = %s::uuid LIMIT 1", (admin_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            if hasattr(row, "keys"):
+                return {"id": str(row["id"]), "name": row["name"] or "", "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or ""}
+            return {"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""}
+        except Exception as e:
+            print(f"CentralDB get_admin_by_id: {e}")
+            return None
+        finally:
+            cur.close()
 
     def get_all_active_admins(self):
         """Return list of {id, name, bot_id, api_key} for all admins."""
