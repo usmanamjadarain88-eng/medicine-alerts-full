@@ -221,8 +221,8 @@ def connect_to_admin():
     return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id, "admin_name": admin_name})
 
 
-def _send_alert_via_relay(bot_id, api_key, alert_type, message):
-    """Send alert to relay so it reaches admin's app (FCM or WebSocket).
+def _send_alert_via_relay(bot_id, api_key, alert_type, message, fcm_token=None):
+    """Send alert to relay so it reaches admin's app. FCM first when fcm_token is provided.
     Returns (True, None) on success, (False, error_message) on failure. One retry after 2s for cold start."""
     import json
     import asyncio
@@ -232,19 +232,23 @@ def _send_alert_via_relay(bot_id, api_key, alert_type, message):
     if not bot_id or not api_key:
         return False, "Missing bot_id or api_key"
     relay_url = os.environ.get("RELAY_URL", "wss://curax-relay.onrender.com").strip()
+    payload = {
+        "action": "alert",
+        "bot_id": bot_id,
+        "api_key": api_key,
+        "type": alert_type or "alert",
+        "message": message or "",
+    }
+    fcm = (fcm_token or "").strip() or None
+    if fcm:
+        payload["fcm_token"] = fcm
     last_error = None
     for attempt in range(2):
         try:
             import websockets
             async def _ws_send():
                 async with websockets.connect(relay_url, close_timeout=5, open_timeout=25) as ws:
-                    await ws.send(json.dumps({
-                        "action": "alert",
-                        "bot_id": bot_id,
-                        "api_key": api_key,
-                        "type": alert_type or "alert",
-                        "message": message or "",
-                    }))
+                    await ws.send(json.dumps(payload))
             asyncio.run(_ws_send())
             return True, None
         except Exception as e:
@@ -274,7 +278,7 @@ def notify_event():
     bot = db.get_admin_bot_by_access_code(access_code)
     if not bot:
         return jsonify({"message": "Admin not found or credentials not yet registered (admin must sign up on app first)"}), 404
-    ok, err = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message)
+    ok, err = _send_alert_via_relay(bot["bot_id"], bot["api_key"], event_type, message, fcm_token=bot.get("fcm_token"))
     if ok:
         return jsonify({"message": "ok"}), 200
     return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
@@ -307,7 +311,8 @@ def notify_event_by_user():
     admin_api_key = info.get("admin_api_key") or ""
     if not admin_bot_id or not admin_api_key:
         return jsonify({"message": "Admin app not registered yet"}), 404
-    ok, err = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message)
+    admin_fcm = db.get_fcm_token_for_bot(admin_bot_id, admin_api_key)
+    ok, err = _send_alert_via_relay(admin_bot_id, admin_api_key, event_type, message, fcm_token=admin_fcm)
     try:
         db.create_alert(info["user_id"], info["admin_id"], event_type, message)
     except Exception:
@@ -340,7 +345,8 @@ def notify_event_to_user():
                 "message": deleted_info.get("message", "The admin has removed you from their account."),
             }), 410
         return jsonify({"message": "User not found or not linked to an admin"}), 404
-    ok, err = _send_alert_via_relay(bot_id, api_key, event_type, message)
+    user_fcm = db.get_fcm_token_for_bot(bot_id, api_key)
+    ok, err = _send_alert_via_relay(bot_id, api_key, event_type, message, fcm_token=user_fcm)
     if ok:
         return jsonify({"message": "ok"}), 200
     return jsonify({"message": "relay send failed", "relay_error": err or "connection failed"}), 500
