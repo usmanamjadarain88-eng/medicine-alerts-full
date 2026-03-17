@@ -1,7 +1,7 @@
 """
-Backend alert scheduler: runs per-admin medicine/reminder/expiry/stock checks
-every 60 seconds, sending alerts via the relay WebSocket and Gmail SMTP.
-Replaces the desktop-only scheduler so alerts work even when the desktop is off.
+Backend alert scheduler: event-based. Alert checks run when data changes (API writes),
+not on a fixed timer. Sends alerts via relay WebSocket and Gmail SMTP.
+Daily summary still runs once at 23:00.
 """
 import datetime
 import time
@@ -29,15 +29,17 @@ class BackendAlertScheduler:
 
     # ---- Per-admin state container ----
 
-    def _state(self, admin_id):
-        if admin_id not in self._admin_state:
-            self._admin_state[admin_id] = {
+    def _state(self, admin_id, user_id=None):
+        """State keyed by (admin_id, user_id). Use user_id=None for dashboard."""
+        key = f"{admin_id}_{user_id or 'dashboard'}"
+        if key not in self._admin_state:
+            self._admin_state[key] = {
                 "sent_medicine": set(),
                 "sent_escalation": set(),
                 "sent_reminder": set(),
                 "condition_alert": {},
             }
-        return self._admin_state[admin_id]
+        return self._admin_state[key]
 
     # ---- Data loading helpers ----
 
@@ -101,6 +103,59 @@ class BackendAlertScheduler:
             "dose_logs": dose_logs,
         }
 
+    def _load_user_context(self, db, admin_ctx, user_id, user_bot_id, user_api_key, user_name):
+        """Build context for one connected user: that user's medicines/boxes/dose_logs, same alert_settings/gmail/admin_bot. Admin receives all alerts from all users."""
+        medicines_raw = db.list_medicines(user_id) or []
+        settings_blob = db.get_alert_settings(user_id) or {}
+        if not isinstance(settings_blob, dict):
+            settings_blob = {}
+        medicine_meta = settings_blob.get("medicine_meta") if isinstance(settings_blob.get("medicine_meta"), dict) else {}
+        if not medicine_meta and isinstance(admin_ctx.get("duid"), str):
+            dashboard_settings = db.get_alert_settings(admin_ctx["duid"]) or {}
+            if isinstance(dashboard_settings, dict):
+                medicine_meta = dashboard_settings.get("medicine_meta") if isinstance(dashboard_settings.get("medicine_meta"), dict) else {}
+
+        boxes = {}
+        for m in medicines_raw:
+            box_id = (m.get("box_id") or "B1").strip().upper()
+            times = m.get("times") if isinstance(m.get("times"), list) else []
+            meta = medicine_meta.get(box_id) if isinstance(medicine_meta.get(box_id), dict) else {}
+            exact_time = (meta.get("exact_time") or "").strip() or (times[0] if times else "08:00")
+            expiry = (meta.get("expiry") or "").strip()
+            qty = 0
+            try:
+                qty = int(m.get("quantity", 0))
+            except (TypeError, ValueError):
+                pass
+            boxes[box_id] = {
+                "name": (m.get("name") or "").strip() or "Medicine",
+                "quantity": qty,
+                "exact_time": exact_time,
+                "expiry": expiry,
+                "times": times,
+            }
+
+        dose_logs = db.list_dose_logs(user_id, limit=200) if hasattr(db, "list_dose_logs") else []
+        prefix = f"[{user_name or 'User'}] " if (user_name or "").strip() else ""
+        return {
+            "admin_id": admin_ctx["admin_id"],
+            "duid": user_id,
+            "admin_bot_id": admin_ctx.get("admin_bot_id", ""),
+            "admin_api_key": admin_ctx.get("admin_api_key", ""),
+            "mobile_bot_config": {},
+            "users": [],
+            "boxes": boxes,
+            "alert_settings": admin_ctx.get("alert_settings") or {},
+            "gmail_config": admin_ctx.get("gmail_config") or {},
+            "medical_reminders": admin_ctx.get("medical_reminders") or {},
+            "dose_logs": dose_logs,
+            "single_user_mode": True,
+            "user_bot_id": (user_bot_id or "").strip(),
+            "user_api_key": (user_api_key or "").strip(),
+            "user_name": (user_name or "").strip(),
+            "message_prefix": prefix,
+        }
+
     # ---- Alert delivery ----
 
     def _send_via_relay(self, bot_id, api_key, alert_type, message):
@@ -130,6 +185,9 @@ class BackendAlertScheduler:
     def _send_user_alerts(self, ctx, alert_type, message):
         """Send alert to users. Desktop-synced mobile_bot_config is the essential
         source; users linked via connection code are additional recipients."""
+        if ctx.get("single_user_mode") and ctx.get("user_bot_id") and ctx.get("user_api_key"):
+            self._send_via_relay(ctx["user_bot_id"], ctx["user_api_key"], alert_type, message)
+            return
         sent_keys = set()
         # Desktop-configured mobile_bot_config (essential -- admin enters on desktop)
         mbc = ctx.get("mobile_bot_config") or {}
@@ -155,6 +213,11 @@ class BackendAlertScheduler:
             self._send_via_relay(bid, akey, alert_type, message)
 
     def _notify_user_and_admin(self, ctx, alert_type, subject, body, send_email=True):
+        """Send to user(s) and always to admin. In single_user_mode sends to that user + admin; body is prefixed with [User name]."""
+        prefix = ctx.get("message_prefix") or ""
+        if prefix:
+            body = prefix + body
+            subject = prefix.strip() + " " + subject if subject else subject
         if send_email:
             email_enabled = ctx["alert_settings"].get("email_alerts", {}).get("enabled", False)
             if email_enabled:
@@ -486,6 +549,48 @@ class BackendAlertScheduler:
                 self._clear_condition_alert(state, empty_key)
                 self._clear_condition_alert(state, low_key)
 
+    # ---- Event-based: run checks for one admin (called from API after data changes) ----
+
+    def run_checks_for_admin(self, admin_id):
+        """Run medicine/reminder/expiry/stock checks for a single admin. Called when data changes (event-based) instead of polling.
+        Safe to call from a background thread; errors are logged and not raised."""
+        if not admin_id:
+            return
+        db = self._get_db()
+        if not db:
+            return
+        try:
+            admin = db.get_admin_by_id(admin_id)
+            if not admin:
+                return
+            ctx = self._load_admin_context(db, admin)
+            if not ctx:
+                return
+            aid = ctx["admin_id"]
+            duid = ctx["duid"]
+            if ctx["boxes"]:
+                state = self._state(aid, duid)
+                self._check_medicine_alerts(ctx, state)
+                self._check_expiry_alerts(ctx, state)
+                self._check_stock_alerts(ctx, state)
+            self._check_medical_reminders(ctx, self._state(aid, duid))
+            for user in ctx.get("users") or []:
+                uid = user.get("id")
+                bid = (user.get("bot_id") or "").strip()
+                akey = (user.get("api_key") or "").strip()
+                name = (user.get("name") or "").strip() or "User"
+                if not uid:
+                    continue
+                user_ctx = self._load_user_context(db, ctx, uid, bid, akey, name)
+                if not user_ctx["boxes"]:
+                    continue
+                state = self._state(aid, uid)
+                self._check_medicine_alerts(user_ctx, state)
+                self._check_expiry_alerts(user_ctx, state)
+                self._check_stock_alerts(user_ctx, state)
+        except Exception as e:
+            print(f"[AlertScheduler] run_checks_for_admin error ({admin_id}): {e}")
+
     # ---- Daily admin summary ----
 
     def _send_daily_admin_summary(self, ctx):
@@ -531,13 +636,33 @@ class BackendAlertScheduler:
         for admin in admins:
             try:
                 ctx = self._load_admin_context(db, admin)
-                if not ctx or not ctx["boxes"]:
+                if not ctx:
                     continue
-                state = self._state(admin["id"])
-                self._check_medicine_alerts(ctx, state)
-                self._check_medical_reminders(ctx, state)
-                self._check_expiry_alerts(ctx, state)
-                self._check_stock_alerts(ctx, state)
+                admin_id = ctx["admin_id"]
+                duid = ctx["duid"]
+                # Dashboard user: medicine/reminder/expiry/stock checks (same as before)
+                if ctx["boxes"]:
+                    state = self._state(admin_id, duid)
+                    self._check_medicine_alerts(ctx, state)
+                    self._check_expiry_alerts(ctx, state)
+                    self._check_stock_alerts(ctx, state)
+                self._check_medical_reminders(ctx, self._state(admin_id, duid))
+
+                # Each connected user: run same medicine/expiry/stock checks; admin receives all alerts
+                for user in ctx.get("users") or []:
+                    uid = user.get("id")
+                    bid = (user.get("bot_id") or "").strip()
+                    akey = (user.get("api_key") or "").strip()
+                    name = (user.get("name") or "").strip() or "User"
+                    if not uid:
+                        continue
+                    user_ctx = self._load_user_context(db, ctx, uid, bid, akey, name)
+                    if not user_ctx["boxes"]:
+                        continue
+                    state = self._state(admin_id, uid)
+                    self._check_medicine_alerts(user_ctx, state)
+                    self._check_expiry_alerts(user_ctx, state)
+                    self._check_stock_alerts(user_ctx, state)
             except Exception as e:
                 print(f"[AlertScheduler] error for admin {admin.get('id', '?')}: {e}")
 
@@ -565,17 +690,11 @@ class BackendAlertScheduler:
             return
         self.running = True
         self._scheduler = schedule.Scheduler()
-        self._scheduler.every(1).minutes.do(self._tick)
         self._scheduler.every().day.at("23:00").do(self._daily_summary_tick)
 
-        print("[AlertScheduler] Backend alert scheduler started (1-min interval)")
+        print("[AlertScheduler] Event-based: checks run on data change; daily summary at 23:00")
 
         def run():
-            # Run first tick immediately
-            try:
-                self._tick()
-            except Exception as e:
-                print(f"[AlertScheduler] initial tick error: {e}")
             while self.running:
                 try:
                     self._scheduler.run_pending()
