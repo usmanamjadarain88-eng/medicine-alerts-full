@@ -549,17 +549,49 @@ class CentralDB:
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
             cur.execute(
-                "SELECT id, name, connection_code FROM admins WHERE connection_code = %s LIMIT 1",
+                "SELECT id, name, connection_code, admin_access_code FROM admins WHERE connection_code = %s LIMIT 1",
                 (code,),
             )
             row = cur.fetchone()
             if row and hasattr(row, "keys"):
-                return {"id": str(row["id"]), "name": row["name"], "connection_code": row["connection_code"]}
+                return {
+                    "id": str(row["id"]),
+                    "name": row["name"],
+                    "connection_code": row["connection_code"],
+                    "admin_access_code": (row.get("admin_access_code") or "").strip(),
+                }
             if row:
-                return {"id": str(row[0]), "name": row[1], "connection_code": row[2]}
+                return {
+                    "id": str(row[0]),
+                    "name": row[1],
+                    "connection_code": row[2],
+                    "admin_access_code": (row[3] or "").strip() if len(row) > 3 else "",
+                }
             return None
         except Exception as e:
             print(f"CentralDB get_admin_by_connection_code: {e}")
+            return None
+        finally:
+            cur.close()
+
+    def get_admin_access_code_by_id(self, admin_id):
+        """Return admin_access_code for this admin UUID (data bus room key)."""
+        aid = (admin_id or "").strip()
+        if not aid:
+            return None
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT admin_access_code FROM admins WHERE id = %s LIMIT 1",
+                (aid,),
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                return str(row[0]).strip()
+            return None
+        except Exception as e:
+            print(f"CentralDB get_admin_access_code_by_id: {e}")
             return None
         finally:
             cur.close()
@@ -716,7 +748,7 @@ class CentralDB:
 
     def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None, fcm_token=None):
         """Insert or update the user by (bot_id, api_key); links this app to the given admin_id. Returns user id or None.
-        If email is provided and already exists for this admin, update that user's bot_id/api_key so their data stays intact.
+        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first.
         fcm_token: when provided, stored for push alerts to this user.
         """
         bot_id = (bot_id or "").strip()
@@ -729,49 +761,11 @@ class CentralDB:
             return None
         email_clean = (email or "").strip()
         fcm = (fcm_token or "").strip() or None
+        if email_clean:
+            self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key)
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            # Prefer existing user by admin_id + email to preserve data on re-install.
-            if email_clean:
-                try:
-                    cur.execute(
-                        """
-                        SELECT id FROM users
-                        WHERE admin_id = %s::uuid AND LOWER(TRIM(email)) = LOWER(TRIM(%s))
-                        AND bot_id != 'dashboard'
-                        ORDER BY updated_at DESC NULLS LAST, created_at DESC
-                        LIMIT 1
-                        """,
-                        (admin_id, email_clean),
-                    )
-                    row = cur.fetchone()
-                    if row:
-                        uid = row["id"] if hasattr(row, "keys") else row[0]
-                        cur.execute(
-                            """
-                            UPDATE users
-                            SET bot_id = %s,
-                                api_key = %s,
-                                name = COALESCE(NULLIF(%s, ''), name),
-                                email = COALESCE(NULLIF(%s, ''), email),
-                                fcm_token = COALESCE(NULLIF(TRIM(%s), ''), fcm_token),
-                                updated_at = NOW()
-                            WHERE id = %s::uuid
-                            RETURNING id
-                            """,
-                            (bot_id, api_key, name or "", email_clean, fcm, str(uid)),
-                        )
-                        row2 = cur.fetchone()
-                        conn.commit()
-                        if row2:
-                            uid2 = row2["id"] if hasattr(row2, "keys") else row2[0]
-                            return str(uid2) if isinstance(uid2, uuid.UUID) else uid2
-                        return str(uid) if isinstance(uid, uuid.UUID) else uid
-                except Exception:
-                    # If email column doesn't exist yet, skip email-based update
-                    conn.rollback()
-
             # Schema: users may have email, fcm_token columns
             cur.execute(
                 """
@@ -1579,40 +1573,53 @@ class CentralDB:
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            try:
-                cur.execute(
-                    "SELECT id, name, email, bot_id, api_key, created_at, desktop_linked_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
-                    (admin_id,),
-                )
-            except Exception:
-                cur.execute(
-                    "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
-                    (admin_id,),
-                )
-            rows = cur.fetchall()
+            rows = None
+            variant = 0  # 0=id,name,email,bot,api,created,desktop | 1=no email | 2=no desktop_linked_at
+            for variant, sql in enumerate((
+                "SELECT id, name, email, bot_id, api_key, created_at, desktop_linked_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                "SELECT id, name, bot_id, api_key, created_at, desktop_linked_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+            )):
+                try:
+                    cur.execute(sql, (admin_id,))
+                    rows = cur.fetchall()
+                    break
+                except Exception:
+                    continue
+            if rows is None:
+                return []
             result = []
             for row in rows:
                 if hasattr(row, "keys"):
-                    dlinked = row.get("desktop_linked_at") if hasattr(row, "get") else (row[6] if len(row) > 6 else None)
+                    dlinked = row.get("desktop_linked_at")
+                    em = (row.get("email") or "").strip() if variant == 0 else ""
                     result.append({
-                        "id": str(row["id"]),
-                        "name": row["name"] or "",
-                        "email": (row.get("email") or "").strip() if hasattr(row, "get") else "",
-                        "bot_id": row["bot_id"] or "",
-                        "api_key": row["api_key"] or "",
+                        "id": str(row["id"]), "name": row["name"] or "", "email": em,
+                        "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or "",
                         "desktop_linked": dlinked is not None,
                     })
                 else:
-                    # Fallback when email column isn't selected
-                    dlinked = row[6] if len(row) > 6 else None
-                    result.append({
-                        "id": str(row[0]),
-                        "name": row[1] or "",
-                        "email": "",
-                        "bot_id": row[2] or "",
-                        "api_key": row[3] or "",
-                        "desktop_linked": dlinked is not None
-                    })
+                    if variant == 0:
+                        em = (row[2] or "").strip() if len(row) > 2 else ""
+                        dlinked = row[6] if len(row) > 6 else None
+                        result.append({
+                            "id": str(row[0]), "name": row[1] or "", "email": em,
+                            "bot_id": row[3] or "", "api_key": row[4] or "",
+                            "desktop_linked": dlinked is not None,
+                        })
+                    elif variant == 1:
+                        dlinked = row[5] if len(row) > 5 else None
+                        result.append({
+                            "id": str(row[0]), "name": row[1] or "", "email": "",
+                            "bot_id": row[2] or "", "api_key": row[3] or "",
+                            "desktop_linked": dlinked is not None,
+                        })
+                    else:
+                        result.append({
+                            "id": str(row[0]), "name": row[1] or "", "email": "",
+                            "bot_id": str(row[2] or ""), "api_key": str(row[3] or ""),
+                            "desktop_linked": False,
+                        })
             return result
         except Exception as e:
             print(f"CentralDB get_all_users_by_admin_id: {e}")
