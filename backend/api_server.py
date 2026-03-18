@@ -429,7 +429,12 @@ def get_admin_connection():
     return jsonify({
         "fcm_token_set": status.get("fcm_token_set", False),
         "connected": status.get("connected", False),
-        "linked_users": [{"id": str(u.get("id", "")), "name": u.get("name"), "bot_id": u.get("bot_id")} for u in users],
+        "linked_users": [{
+            "id": str(u.get("id", "")),
+            "name": u.get("name"),
+            "email": u.get("email", ""),
+            "bot_id": u.get("bot_id")
+        } for u in users],
     })
 
 
@@ -549,7 +554,17 @@ def admin_data():
         data = db.get_admin_dashboard_data(admin_id, last_sync_time=last_sync_time)
     if data is None:
         return jsonify({"message": "Failed to load admin data"}), 500
-    # Normalize so app always gets same structure: lists are never None, each medicine has "times" as list
+    out = _normalize_user_data_response(data)
+    n_meds = len(out["medicines"])
+    if n_meds == 0:
+        print(f"  [admin/data] returning 0 medicines for this admin")
+    else:
+        print(f"  [admin/data] returning {n_meds} medicines")
+    return jsonify(out)
+
+
+def _normalize_user_data_response(data):
+    """Same shape as admin_data: medicines, dose_logs, alert_settings, alerts, medical_reminders, server_time, incremental."""
     medicines = data.get("medicines") or []
     out = {
         "medicines": [dict(m) for m in medicines],
@@ -574,31 +589,49 @@ def admin_data():
                 m["quantity"] = int(m["quantity"])
             except (TypeError, ValueError):
                 m["quantity"] = 0
-
         box_id = (m.get("box_id") or "").strip().upper()
         meta = medicine_meta.get(box_id) if box_id else None
         if not isinstance(meta, dict):
             meta = {}
-
         exact_time = (meta.get("exact_time") or "").strip() or (m["times"][0] if m["times"] else "08:00")
         dose_per_day = _safe_int(meta.get("dose_per_day"), 0)
         if dose_per_day <= 0:
             dose_per_day = max(1, len(m["times"]))
         instructions = (meta.get("instructions") or m.get("dosage") or "").strip()
         expiry = (meta.get("expiry") or "").strip()
-
         m["exact_time"] = exact_time
         m["dose_per_day"] = dose_per_day
         m["instructions"] = instructions
         m["expiry"] = expiry
     if data.get("medicine_box_ids") is not None:
         out["medicine_box_ids"] = data["medicine_box_ids"]
-    n_meds = len(out["medicines"])
-    if n_meds == 0:
-        print(f"  [admin/data] returning 0 medicines for this admin")
-    else:
-        print(f"  [admin/data] returning {n_meds} medicines")
-    return jsonify(out)
+    return out
+
+
+@app.route("/user/data", methods=["GET"])
+def user_data():
+    """GET /user/data?bot_id=...&api_key=...&last_sync_time=... (optional).
+    Returns this user's data in same shape as GET /admin/data (for desktop linked as user). Data saved by admin for this user is stored per user_id; when user links desktop they get their data here."""
+    bot_id = (request.args.get("bot_id") or "").strip()
+    api_key = (request.args.get("api_key") or "").strip()
+    last_sync_time = (request.args.get("last_sync_time") or "").strip() or None
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not bot_id or not api_key:
+        return jsonify({"message": "bot_id and api_key required"}), 400
+    info = db.get_user_and_admin_bot_by_user_bot(bot_id, api_key)
+    if not info:
+        deleted_info = getattr(db, "get_deleted_user_notification", None) and db.get_deleted_user_notification(bot_id, api_key)
+        if deleted_info:
+            return jsonify({"message": deleted_info.get("message", "The admin has removed you from their account.")}), 410
+        return jsonify({"message": "User not found"}), 404
+    user_id = info["user_id"]
+    admin_id = info["admin_id"]
+    data = db.get_user_data_for_admin(admin_id, user_id, last_sync_time=last_sync_time)
+    if data is None:
+        return jsonify({"message": "Failed to load user data"}), 500
+    return jsonify(_normalize_user_data_response(data))
 
 
 @app.route("/admin/sync", methods=["POST"])
@@ -799,7 +832,7 @@ def put_admin_medical_reminders():
     if role != "admin":
         return jsonify({"message": "Access code is not for admin"}), 403
     act_as = (data.get("act_as_user_id") or "").strip() or None
-    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    duid, err = _target_user_for_admin(db, admin_id, act_as, check_desktop_linked=False)
     if err:
         return err
     # Normalize structure
@@ -836,11 +869,15 @@ def _resolve_admin_from_access_code(db, access_code):
     return admin_id, None
 
 
-def _target_user_for_admin(db, admin_id, act_as_user_id):
-    """Return user_id to use for admin operations: act_as_user_id if valid, else dashboard user. Returns (user_id, None) or (None, error_response)."""
+def _target_user_for_admin(db, admin_id, act_as_user_id, check_desktop_linked=False):
+    """Return user_id to use for admin operations: act_as_user_id if valid, else dashboard user.
+    If check_desktop_linked and acting as a connected user, require that user to have linked desktop once.
+    Returns (user_id, None) or (None, error_response)."""
     if act_as_user_id and (act_as_user_id or "").strip():
         uid = (act_as_user_id or "").strip()
         if db.user_belongs_to_admin(uid, admin_id):
+            if check_desktop_linked and not getattr(db, "user_has_desktop_linked", lambda _: True)(uid):
+                return None, (jsonify({"message": "User must login to desktop first. Changes sync to the user's desktop."}), 400)
             return uid, None
     duid = db.get_dashboard_user_id(admin_id)
     if not duid:
@@ -937,7 +974,7 @@ def put_admin_medicines():
         return jsonify({"message": "medicines must be a list"}), 400
 
     act_as = (data.get("act_as_user_id") or "").strip() or None
-    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    duid, err = _target_user_for_admin(db, admin_id, act_as, check_desktop_linked=False)
     if err:
         return err
 
@@ -1052,7 +1089,7 @@ def put_admin_alert_settings():
         return err
 
     act_as = (data.get("act_as_user_id") or "").strip() or None
-    duid, err = _target_user_for_admin(db, admin_id, act_as)
+    duid, err = _target_user_for_admin(db, admin_id, act_as, check_desktop_linked=False)
     if err:
         return err
 
