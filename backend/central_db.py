@@ -210,13 +210,18 @@ class CentralDB:
     def get_user_by_desktop_link_code(self, code):
         """Validate user desktop link code, return user info and admin info; consume the code.
         Returns { user_id, user_name, bot_id, api_key, admin_id, admin_name } or None.
-        Backend knows which user this code was given to (user created it in app)."""
+        Sets users.desktop_linked_at when code is used so admin can only save for users who linked desktop."""
         code = (code or "").strip().upper()
         if not code:
             return None
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS desktop_linked_at TIMESTAMPTZ DEFAULT NULL")
+                conn.commit()
+            except Exception:
+                conn.rollback()
             cur.execute(
                 """SELECT d.user_id, u.name AS user_name, u.bot_id, u.api_key, u.admin_id, a.name AS admin_name
                    FROM user_desktop_link_codes d
@@ -234,6 +239,10 @@ class CentralDB:
             api_key = (row["api_key"] if hasattr(row, "keys") else row[3]) or ""
             admin_id = row["admin_id"] if hasattr(row, "keys") else row[4]
             admin_name = (row["admin_name"] if hasattr(row, "keys") else row[5]) or "Admin"
+            try:
+                cur.execute("UPDATE users SET desktop_linked_at = COALESCE(desktop_linked_at, NOW()) WHERE id = %s", (user_id,))
+            except Exception:
+                pass
             cur.execute("DELETE FROM user_desktop_link_codes WHERE code = %s", (code,))
             conn.commit()
             return {
@@ -707,7 +716,7 @@ class CentralDB:
 
     def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None, fcm_token=None):
         """Insert or update the user by (bot_id, api_key); links this app to the given admin_id. Returns user id or None.
-        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first.
+        If email is provided and already exists for this admin, update that user's bot_id/api_key so their data stays intact.
         fcm_token: when provided, stored for push alerts to this user.
         """
         bot_id = (bot_id or "").strip()
@@ -720,11 +729,49 @@ class CentralDB:
             return None
         email_clean = (email or "").strip()
         fcm = (fcm_token or "").strip() or None
-        if email_clean:
-            self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key)
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
+            # Prefer existing user by admin_id + email to preserve data on re-install.
+            if email_clean:
+                try:
+                    cur.execute(
+                        """
+                        SELECT id FROM users
+                        WHERE admin_id = %s::uuid AND LOWER(TRIM(email)) = LOWER(TRIM(%s))
+                        AND bot_id != 'dashboard'
+                        ORDER BY updated_at DESC NULLS LAST, created_at DESC
+                        LIMIT 1
+                        """,
+                        (admin_id, email_clean),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        uid = row["id"] if hasattr(row, "keys") else row[0]
+                        cur.execute(
+                            """
+                            UPDATE users
+                            SET bot_id = %s,
+                                api_key = %s,
+                                name = COALESCE(NULLIF(%s, ''), name),
+                                email = COALESCE(NULLIF(%s, ''), email),
+                                fcm_token = COALESCE(NULLIF(TRIM(%s), ''), fcm_token),
+                                updated_at = NOW()
+                            WHERE id = %s::uuid
+                            RETURNING id
+                            """,
+                            (bot_id, api_key, name or "", email_clean, fcm, str(uid)),
+                        )
+                        row2 = cur.fetchone()
+                        conn.commit()
+                        if row2:
+                            uid2 = row2["id"] if hasattr(row2, "keys") else row2[0]
+                            return str(uid2) if isinstance(uid2, uuid.UUID) else uid2
+                        return str(uid) if isinstance(uid, uuid.UUID) else uid
+                except Exception:
+                    # If email column doesn't exist yet, skip email-based update
+                    conn.rollback()
+
             # Schema: users may have email, fcm_token columns
             cur.execute(
                 """
@@ -1532,21 +1579,58 @@ class CentralDB:
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
-            cur.execute(
-                "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
-                (admin_id,),
-            )
+            try:
+                cur.execute(
+                    "SELECT id, name, email, bot_id, api_key, created_at, desktop_linked_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                    (admin_id,),
+                )
+            except Exception:
+                cur.execute(
+                    "SELECT id, name, bot_id, api_key, created_at FROM users WHERE admin_id = %s::uuid AND bot_id != 'dashboard' ORDER BY created_at DESC",
+                    (admin_id,),
+                )
             rows = cur.fetchall()
             result = []
             for row in rows:
                 if hasattr(row, "keys"):
-                    result.append({"id": str(row["id"]), "name": row["name"] or "", "bot_id": row["bot_id"] or "", "api_key": row["api_key"] or ""})
+                    dlinked = row.get("desktop_linked_at") if hasattr(row, "get") else (row[6] if len(row) > 6 else None)
+                    result.append({
+                        "id": str(row["id"]),
+                        "name": row["name"] or "",
+                        "email": (row.get("email") or "").strip() if hasattr(row, "get") else "",
+                        "bot_id": row["bot_id"] or "",
+                        "api_key": row["api_key"] or "",
+                        "desktop_linked": dlinked is not None,
+                    })
                 else:
-                    result.append({"id": str(row[0]), "name": row[1] or "", "bot_id": row[2] or "", "api_key": row[3] or ""})
+                    # Fallback when email column isn't selected
+                    dlinked = row[6] if len(row) > 6 else None
+                    result.append({
+                        "id": str(row[0]),
+                        "name": row[1] or "",
+                        "email": "",
+                        "bot_id": row[2] or "",
+                        "api_key": row[3] or "",
+                        "desktop_linked": dlinked is not None
+                    })
             return result
         except Exception as e:
             print(f"CentralDB get_all_users_by_admin_id: {e}")
             return []
+        finally:
+            cur.close()
+
+    def user_has_desktop_linked(self, user_id):
+        """True if this user has linked a desktop at least once (desktop_linked_at set)."""
+        if not user_id:
+            return False
+        conn = self._ensure_conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1 FROM users WHERE id = %s::uuid AND desktop_linked_at IS NOT NULL LIMIT 1", (user_id,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
         finally:
             cur.close()
 
