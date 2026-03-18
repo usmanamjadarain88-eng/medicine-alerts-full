@@ -218,7 +218,15 @@ def connect_to_admin():
     user_id = db.upsert_user_from_bot(bot_id, api_key, admin_id, name=name, email=email or None)
     if not user_id:
         return jsonify({"message": "Failed to link user"}), 500
-    return jsonify({"message": "ok", "admin_id": admin_id, "user_id": user_id, "admin_name": admin_name})
+    # Same room key as desktop/admin app WebSocket (NOT connection_code — data bus uses admin_access_code).
+    databus_access_code = (admin.get("admin_access_code") or "").strip()
+    return jsonify({
+        "message": "ok",
+        "admin_id": admin_id,
+        "user_id": user_id,
+        "admin_name": admin_name,
+        "databus_access_code": databus_access_code,
+    })
 
 
 def _wake_relay_if_needed(relay_url):
@@ -429,12 +437,7 @@ def get_admin_connection():
     return jsonify({
         "fcm_token_set": status.get("fcm_token_set", False),
         "connected": status.get("connected", False),
-        "linked_users": [{
-            "id": str(u.get("id", "")),
-            "name": u.get("name"),
-            "email": u.get("email", ""),
-            "bot_id": u.get("bot_id")
-        } for u in users],
+        "linked_users": [{"id": str(u.get("id", "")), "name": u.get("name"), "email": u.get("email") or "", "bot_id": u.get("bot_id")} for u in users],
     })
 
 
@@ -632,6 +635,25 @@ def user_data():
     if data is None:
         return jsonify({"message": "Failed to load user data"}), 500
     return jsonify(_normalize_user_data_response(data))
+
+
+@app.route("/user/databus-room", methods=["GET"])
+def user_databus_room():
+    """GET ?bot_id=&api_key= → { databus_access_code } for WebSocket data bus (same room as admin/desktop)."""
+    bot_id = (request.args.get("bot_id") or "").strip()
+    api_key = (request.args.get("api_key") or "").strip()
+    db = get_db()
+    if not db:
+        return jsonify({"message": "Central DB not configured"}), 503
+    if not bot_id or not api_key:
+        return jsonify({"message": "bot_id and api_key required"}), 400
+    info = db.get_user_and_admin_bot_by_user_bot(bot_id, api_key)
+    if not info:
+        return jsonify({"message": "User not found"}), 404
+    ac = db.get_admin_access_code_by_id(info["admin_id"])
+    if not ac:
+        return jsonify({"message": "Admin not found"}), 404
+    return jsonify({"databus_access_code": ac})
 
 
 @app.route("/admin/sync", methods=["POST"])
