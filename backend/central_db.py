@@ -717,8 +717,9 @@ class CentralDB:
             cur.close()
 
     # ---- Users (from System Settings: bot_id + api_key, linked to admin_id) ----
-    def _delete_other_users_by_admin_and_email(self, admin_id, email, keep_bot_id, keep_api_key):
-        """Remove any other user rows for this admin_id + email (different device/install). Keeps the row for (keep_bot_id, keep_api_key)."""
+    def _delete_other_users_by_admin_and_email(self, admin_id, email, keep_bot_id, keep_api_key, migrate_to_user_id=None):
+        """Remove any other user rows for this admin_id + email (different device/install). Keeps the row for (keep_bot_id, keep_api_key).
+        If migrate_to_user_id is provided, migrates medicines, dose_logs, and alert_settings from old users to the new user before deleting."""
         email = (email or "").strip()
         if not email:
             return
@@ -729,6 +730,105 @@ class CentralDB:
         conn = self._ensure_conn()
         cur = conn.cursor()
         try:
+            # First, find old user_ids that will be deleted
+            cur.execute(
+                """
+                SELECT id FROM users
+                WHERE admin_id = %s::uuid AND LOWER(TRIM(email)) = LOWER(TRIM(%s))
+                AND (bot_id != %s OR api_key != %s)
+                """,
+                (admin_id, email, keep_bot_id, keep_api_key),
+            )
+            old_user_ids = [row["id"] if hasattr(row, "keys") else row[0] for row in cur.fetchall()]
+            
+            # Migrate data from old users to new user if provided
+            if migrate_to_user_id and old_user_ids:
+                try:
+                    uuid.UUID(str(migrate_to_user_id))
+                    for old_uid in old_user_ids:
+                        # Migrate medicines (all medicines from old user to new user)
+                        cur.execute(
+                            "UPDATE medicines SET user_id = %s::uuid WHERE user_id = %s::uuid",
+                            (migrate_to_user_id, old_uid)
+                        )
+                        # Migrate dose_logs (all dose logs from old user to new user)
+                        cur.execute(
+                            "UPDATE dose_logs SET user_id = %s::uuid WHERE user_id = %s::uuid",
+                            (migrate_to_user_id, old_uid)
+                        )
+                        # Migrate alerts (all alerts from old user to new user)
+                        cur.execute(
+                            "UPDATE alerts SET user_id = %s::uuid WHERE user_id = %s::uuid",
+                            (migrate_to_user_id, old_uid)
+                        )
+                        # Migrate sync_logs (sync history from old user to new user)
+                        try:
+                            cur.execute(
+                                "UPDATE sync_logs SET user_id = %s::uuid WHERE user_id = %s::uuid",
+                                (migrate_to_user_id, old_uid)
+                            )
+                        except Exception:
+                            pass  # sync_logs might not exist or have different schema
+                        # Migrate alert_settings: merge settings from old user into new user
+                        # If new user already has settings, merge; otherwise copy old user's settings
+                        try:
+                            # Get old user's alert_settings
+                            cur.execute(
+                                "SELECT settings FROM alert_settings WHERE user_id = %s::uuid LIMIT 1",
+                                (old_uid,)
+                            )
+                            old_settings_row = cur.fetchone()
+                            if old_settings_row:
+                                old_settings_raw = old_settings_row["settings"] if hasattr(old_settings_row, "keys") else old_settings_row[0]
+                                old_settings = old_settings_raw if isinstance(old_settings_raw, dict) else (json.loads(old_settings_raw) if isinstance(old_settings_raw, str) and old_settings_raw else {})
+                                
+                                # Get new user's existing alert_settings (if any)
+                                cur.execute(
+                                    "SELECT settings FROM alert_settings WHERE user_id = %s::uuid LIMIT 1",
+                                    (migrate_to_user_id,)
+                                )
+                                new_settings_row = cur.fetchone()
+                                new_settings = {}
+                                if new_settings_row:
+                                    new_settings_raw = new_settings_row["settings"] if hasattr(new_settings_row, "keys") else new_settings_row[0]
+                                    new_settings = new_settings_raw if isinstance(new_settings_raw, dict) else (json.loads(new_settings_raw) if isinstance(new_settings_raw, str) and new_settings_raw else {})
+                                
+                                # Merge: prioritize old user's data (they're re-signing up, so their previous data should be preserved)
+                                # Start with old_settings, then merge in any new_settings that don't conflict
+                                merged_settings = old_settings.copy()
+                                # Only add new_settings keys that don't exist in old_settings (preserve old data)
+                                for key, value in new_settings.items():
+                                    if key not in merged_settings:
+                                        merged_settings[key] = value
+                                    # Special handling for nested dicts: merge them too
+                                    elif isinstance(merged_settings[key], dict) and isinstance(value, dict):
+                                        merged_dict = merged_settings[key].copy()
+                                        merged_dict.update(value)
+                                        merged_settings[key] = merged_dict
+                                
+                                # Upsert merged settings (old user's data is preserved)
+                                merged_json = json.dumps(merged_settings)
+                                cur.execute(
+                                    """INSERT INTO alert_settings (user_id, settings, updated_at)
+                                       VALUES (%s::uuid, %s::jsonb, NOW())
+                                       ON CONFLICT (user_id) DO UPDATE SET settings = EXCLUDED.settings, updated_at = NOW()""",
+                                    (migrate_to_user_id, merged_json)
+                                )
+                            else:
+                                # No old settings, but update user_id if row exists (shouldn't happen, but safe)
+                                cur.execute(
+                                    "UPDATE alert_settings SET user_id = %s::uuid WHERE user_id = %s::uuid",
+                                    (migrate_to_user_id, old_uid)
+                                )
+                        except Exception as e:
+                            # If alert_settings table doesn't exist or has issues, log but continue
+                            if "column" not in str(e).lower() and "table" not in str(e).lower():
+                                print(f"CentralDB migrate alert_settings: {e}")
+                except (ValueError, TypeError) as e:
+                    print(f"CentralDB migrate data: invalid UUID - {e}")
+                    pass  # Invalid UUID, skip migration
+            
+            # Now delete old users
             cur.execute(
                 """
                 DELETE FROM users
@@ -748,7 +848,8 @@ class CentralDB:
 
     def upsert_user_from_bot(self, bot_id, api_key, admin_id, name=None, email=None, fcm_token=None):
         """Insert or update the user by (bot_id, api_key); links this app to the given admin_id. Returns user id or None.
-        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first.
+        If email is provided, any other user rows for the same admin_id + email (previous installs) are deleted first,
+        but their medicines, dose_logs, and alert_settings are migrated to the new user to preserve data.
         fcm_token: when provided, stored for push alerts to this user.
         """
         bot_id = (bot_id or "").strip()
@@ -761,8 +862,6 @@ class CentralDB:
             return None
         email_clean = (email or "").strip()
         fcm = (fcm_token or "").strip() or None
-        if email_clean:
-            self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key)
         conn = self._ensure_conn()
         cur = conn.cursor(cursor_factory=RealDictCursor) if RealDictCursor else conn.cursor()
         try:
@@ -785,7 +884,13 @@ class CentralDB:
             conn.commit()
             if row:
                 uid = row["id"] if hasattr(row, "keys") else row[0]
-                return str(uid) if isinstance(uid, uuid.UUID) else uid
+                new_user_id = str(uid) if isinstance(uid, uuid.UUID) else uid
+                
+                # After creating/updating new user, migrate data from old users (if email provided)
+                if email_clean:
+                    self._delete_other_users_by_admin_and_email(admin_id, email_clean, bot_id, api_key, migrate_to_user_id=new_user_id)
+                
+                return new_user_id
             return None
         except Exception as e:
             conn.rollback()
