@@ -68,7 +68,7 @@ def get_data_bus_url():
             except Exception:
                 pass
     # Default: deployed data bus on Railway (receives notify_admin from backend for real-time sync)
-    return "https://databus-production.up.railway.app"
+    return "https://databus-production-6eef.up.railway.app"
 
 
 try:
@@ -1168,7 +1168,16 @@ def create_medicine():
     mid = db.create_medicine(user_id, name, box_id=data.get("box_id"), dosage=data.get("dosage"), times=data.get("times"), low_stock=data.get("low_stock", 5))
     if not mid:
         return jsonify({"message": "create failed"}), 500
-    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id))
+    admin_id = db.get_admin_id_by_user_id(user_id)
+    _trigger_alert_checks_for_admin(admin_id)
+    # Keep desktop/app/user standalone live via databus when legacy /medicines endpoint is used.
+    try:
+        if admin_id:
+            access_code = db.get_admin_access_code_by_id(admin_id)
+            if access_code:
+                notify_databus(access_code)
+    except Exception:
+        pass
     return jsonify({"id": mid, "user_id": user_id, "name": name, "box_id": data.get("box_id"), "dosage": data.get("dosage"), "times": data.get("times") or [], "low_stock": data.get("low_stock", 5)})
 
 
@@ -1182,7 +1191,15 @@ def update_medicine(medicine_id):
     ok = db.update_medicine(medicine_id, name=data.get("name"), box_id=data.get("box_id"), dosage=data.get("dosage"), times=data.get("times"), low_stock=data.get("low_stock"))
     if not ok:
         return jsonify({"message": "update failed"}), 404
-    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id) if user_id else None)
+    admin_id = db.get_admin_id_by_user_id(user_id) if user_id else None
+    _trigger_alert_checks_for_admin(admin_id)
+    try:
+        if admin_id:
+            access_code = db.get_admin_access_code_by_id(admin_id)
+            if access_code:
+                notify_databus(access_code)
+    except Exception:
+        pass
     return jsonify({"message": "ok"})
 
 
@@ -1195,7 +1212,15 @@ def delete_medicine(medicine_id):
     ok = db.delete_medicine(medicine_id)
     if not ok:
         return jsonify({"message": "not found"}), 404
-    _trigger_alert_checks_for_admin(db.get_admin_id_by_user_id(user_id) if user_id else None)
+    admin_id = db.get_admin_id_by_user_id(user_id) if user_id else None
+    _trigger_alert_checks_for_admin(admin_id)
+    try:
+        if admin_id:
+            access_code = db.get_admin_access_code_by_id(admin_id)
+            if access_code:
+                notify_databus(access_code)
+    except Exception:
+        pass
     return "", 204
 
 
